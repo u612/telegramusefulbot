@@ -31,7 +31,7 @@ from bot.keyboards.pdf import (
     PDF_TO_IMG_PNG, PDF_TO_IMG_JPEG,
 )
 from bot.keyboards.common import back_home_cancel
-from core.constants import SUPPORTED_PDF_EXTS, SUPPORTED_IMAGE_EXTS, ALLOWED_MIME_TYPES
+from core.constants import CB_PDF, SUPPORTED_PDF_EXTS, SUPPORTED_IMAGE_EXTS, ALLOWED_MIME_TYPES
 from core.config import settings
 from core.logger import logger
 
@@ -60,6 +60,20 @@ router = Router()
 
 _PDF_MIME = {"application/pdf"}
 _IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp", "image/bmp", "image/tiff", "image/gif"}
+
+
+# --------------------------------------------------------------------------
+# Main menu entry point
+# --------------------------------------------------------------------------
+
+@router.callback_query(F.data == CB_PDF)
+async def pdf_menu_open(query: CallbackQuery, state: FSMContext):
+    """Opens the PDF submenu from the main menu's "📄 PDF" button."""
+    await query.message.edit_text(
+        "📄 PDF Toolkit -- choose an operation:",
+        reply_markup=get_pdf_menu(),
+    )
+    await query.answer()
 
 
 # --------------------------------------------------------------------------
