@@ -4,9 +4,9 @@ from aiogram.types import Message, CallbackQuery, FSInputFile
 from aiogram.fsm.context import FSMContext
 
 from bot.states.document import DocumentStates
-from bot.keyboards.document import DOC_CONVERT_TO_PDF
+from bot.keyboards.document import get_document_menu, DOC_CONVERT_TO_PDF
 from bot.keyboards.common import back_home_cancel
-from core.constants import SUPPORTED_DOC_EXTS
+from core.constants import CB_DOCUMENT, SUPPORTED_DOC_EXTS
 from core.config import settings
 from core.logger import logger
 
@@ -15,6 +15,16 @@ from utils.tempfiles import new_temp_path, track_temp_file, untrack_temp_files, 
 from utils.validators import validate_extension
 
 router = Router()
+
+
+@router.callback_query(F.data == CB_DOCUMENT)
+async def document_menu_open(query: CallbackQuery, state: FSMContext):
+    """Opens the Document submenu from the main menu's "📃 Documents" button."""
+    await query.message.edit_text(
+        "📃 Document Toolkit -- choose an operation:",
+        reply_markup=get_document_menu(),
+    )
+    await query.answer()
 
 
 async def _track_usage(user_repo, db_user) -> None:
