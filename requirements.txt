@@ -1,0 +1,39 @@
+# --- Bot framework / web ---
+aiogram==3.3.0
+fastapi==0.110.0
+uvicorn[standard]==0.27.1
+
+# --- Database ---
+sqlalchemy==2.0.27
+alembic==1.13.1
+asyncpg==0.29.0
+
+# --- Config / logging ---
+pydantic==2.6.1
+pydantic-settings==2.2.1
+python-dotenv==1.0.1
+loguru==0.7.2
+
+# --- Validation ---
+python-magic==0.4.27
+
+# --- PDF ---
+PyMuPDF==1.23.26
+pypdf==4.0.1
+reportlab==4.0.9
+
+# --- Images ---
+Pillow==10.2.0
+rembg==2.0.50
+
+# --- OCR (Tesseract via pytesseract -- see services/ocr/extractor.py for
+# the rationale for not also using EasyOCR) ---
+pytesseract==0.3.10
+
+# --- Archives ---
+py7zr==0.20.8
+rarfile==4.1
+
+# --- Misc ---
+aiohttp==3.9.3
+cachetools==5.3.2
