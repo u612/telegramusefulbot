@@ -7,11 +7,12 @@ from aiogram.fsm.context import FSMContext
 
 from bot.states.archive import ArchiveStates
 from bot.keyboards.archive import (
+    get_archive_menu,
     ARC_COMPRESS, ARC_EXTRACT, ARC_DONE, ARC_FORMAT_ZIP, ARC_FORMAT_7Z,
     archive_format_keyboard, archive_upload_done_keyboard,
 )
 from bot.keyboards.common import back_home_cancel
-from core.constants import SUPPORTED_ARCHIVE_EXTS
+from core.constants import CB_ARCHIVE, SUPPORTED_ARCHIVE_EXTS
 from core.config import settings
 from core.logger import logger
 
@@ -24,6 +25,16 @@ from utils.tempfiles import new_temp_path, track_temp_file, untrack_temp_files, 
 from utils.validators import validate_extension
 
 router = Router()
+
+
+@router.callback_query(F.data == CB_ARCHIVE)
+async def archive_menu_open(query: CallbackQuery, state: FSMContext):
+    """Opens the Archive submenu from the main menu's "📦 Archives" button."""
+    await query.message.edit_text(
+        "📦 Archive Toolkit -- choose an operation:",
+        reply_markup=get_archive_menu(),
+    )
+    await query.answer()
 
 
 async def _track_usage(user_repo, db_user) -> None:
