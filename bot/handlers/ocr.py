@@ -4,9 +4,9 @@ from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
 
 from bot.states.ocr import OCRStates
-from bot.keyboards.ocr import OCR_START, OCR_LANG_PREFIX, ocr_language_keyboard
+from bot.keyboards.ocr import get_ocr_menu, OCR_START, OCR_LANG_PREFIX, ocr_language_keyboard
 from bot.keyboards.common import back_home_cancel
-from core.constants import SUPPORTED_IMAGE_EXTS
+from core.constants import CB_OCR, SUPPORTED_IMAGE_EXTS
 from core.config import settings
 from core.logger import logger
 
@@ -17,6 +17,16 @@ from utils.validators import validate_extension, validate_upload
 router = Router()
 
 _IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp", "image/bmp", "image/tiff", "image/gif"}
+
+
+@router.callback_query(F.data == CB_OCR)
+async def ocr_menu_open(query: CallbackQuery, state: FSMContext):
+    """Opens the OCR submenu from the main menu's "🔍 OCR" button."""
+    await query.message.edit_text(
+        "🔍 OCR Toolkit -- choose an operation:",
+        reply_markup=get_ocr_menu(),
+    )
+    await query.answer()
 
 
 async def _track_usage(user_repo, db_user) -> None:
