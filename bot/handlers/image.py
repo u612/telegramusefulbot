@@ -9,6 +9,7 @@ from aiogram.fsm.context import FSMContext
 
 from bot.states.image import ImageStates
 from bot.keyboards.image import (
+    get_image_menu,
     IMG_COMPRESS, IMG_RESIZE, IMG_CROP, IMG_ROTATE, IMG_FLIP, IMG_CONVERT,
     IMG_BG_REMOVE, IMG_WATERMARK, IMG_METADATA_REMOVE,
     IMG_COMPRESS_LOW, IMG_COMPRESS_MEDIUM, IMG_COMPRESS_HIGH,
@@ -19,7 +20,7 @@ from bot.keyboards.image import (
     convert_format_keyboard,
 )
 from bot.keyboards.common import back_home_cancel
-from core.constants import SUPPORTED_IMAGE_EXTS
+from core.constants import CB_IMAGE, SUPPORTED_IMAGE_EXTS
 from core.config import settings
 from core.logger import logger
 
@@ -40,6 +41,16 @@ from utils.validators import validate_extension, validate_upload
 router = Router()
 
 _IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp", "image/bmp", "image/tiff", "image/gif"}
+
+
+@router.callback_query(F.data == CB_IMAGE)
+async def image_menu_open(query: CallbackQuery, state: FSMContext):
+    """Opens the Image submenu from the main menu's "🖼 Images" button."""
+    await query.message.edit_text(
+        "🖼 Image Toolkit -- choose an operation:",
+        reply_markup=get_image_menu(),
+    )
+    await query.answer()
 
 
 async def _track_usage(user_repo, db_user) -> None:
