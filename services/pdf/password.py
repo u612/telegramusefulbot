@@ -53,7 +53,8 @@ class PDFPassword:
         try:
             reader = PdfReader(input_path)
         except Exception as e:
-            raise PDFProcessingError(f"Could not read this PDF (corrupted or unsupported format): {e}")
+            logger.exception(f"Could not read PDF for password removal: {e}")
+            raise PDFProcessingError("Invalid or corrupted PDF.") from e
 
         if not reader.is_encrypted:
             raise PDFProcessingError("This PDF isn't password-protected.")
