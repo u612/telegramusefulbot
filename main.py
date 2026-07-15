@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 
 import uvicorn
 from aiogram import Bot, Dispatcher
-from aiogram.types import BotCommand, ErrorEvent
+from aiogram.types import BotCommand, BotCommandScopeChat, ErrorEvent
 from aiogram.fsm.storage.memory import MemoryStorage
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -18,10 +18,12 @@ from bot.handlers import (
     document_router,
     ocr_router,
     settings_router,
+    owner_router,
 )
 from bot.middlewares import LoggingMiddleware, DatabaseMiddleware, ThrottlingMiddleware
-from database.session import engine, Base
+from database.session import engine, Base, run_light_migrations
 from services.security.validator import init_validator
+from services.telegram import shutdown_userbot
 
 # Initialize bot and dispatcher
 bot = Bot(token=settings.BOT_TOKEN)
@@ -44,6 +46,7 @@ dp.include_router(archive_router)
 dp.include_router(document_router)
 dp.include_router(ocr_router)
 dp.include_router(settings_router)
+dp.include_router(owner_router)
 
 
 @dp.errors()
@@ -89,6 +92,24 @@ async def lifespan(app: FastAPI):
         BotCommand(command="cancel", description="Cancel current operation"),
     ])
 
+    if settings.OWNER_ID:
+        try:
+            await bot.set_my_commands(
+                [
+                    BotCommand(command="start", description="Start the bot"),
+                    BotCommand(command="cancel", description="Cancel current operation"),
+                    BotCommand(command="upgrade", description="Raise a user's merge queue limit"),
+                    BotCommand(command="userbot_on", description="Enable the userbot large-file transport"),
+                    BotCommand(command="userbot_off", description="Disable the userbot large-file transport"),
+                    BotCommand(command="status", description="Show bot/userbot status"),
+                ],
+                scope=BotCommandScopeChat(chat_id=settings.OWNER_ID),
+            )
+        except Exception:
+            # Non-fatal: the owner just won't see the extra commands in their
+            # menu until they've started a chat with the bot at least once.
+            logger.exception("Failed to set owner-scoped bot commands (non-fatal).")
+
     # Drop any webhook + pending updates left over from a previous deployment
     # before starting long polling, otherwise Telegram returns a 409 Conflict.
     await bot.delete_webhook(drop_pending_updates=True)
@@ -99,6 +120,7 @@ async def lifespan(app: FastAPI):
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            await run_light_migrations(conn)
         logger.info("Database tables verified/created.")
     except Exception:
         logger.exception("Database initialization failed -- continuing startup, "
@@ -127,6 +149,7 @@ async def lifespan(app: FastAPI):
             pass
     await bot.session.close()
     await engine.dispose()
+    await shutdown_userbot()
 
 
 app = FastAPI(lifespan=lifespan)
