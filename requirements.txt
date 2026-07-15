@@ -36,3 +36,10 @@ rarfile==4.1
 # --- Misc ---
 aiohttp==3.9.3
 cachetools==5.3.2
+
+# --- Optional: userbot transport for Merge files too large for the public
+# Bot API (~20MB download limit). Only used if the owner enables it via
+# /userbot_on AND USERBOT_API_ID/USERBOT_API_HASH/USERBOT_SESSION_STRING are
+# set; the bot runs fine without ever touching this if you don't need it. ---
+pyrogram==2.0.106
+tgcrypto==1.2.5
