@@ -24,6 +24,13 @@ class ThrottlingMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: Dict[str, Any],
     ) -> Any:
+        # A media group (multiple documents/photos sent together) arrives as
+        # several distinct updates in quick succession -- that's Telegram's
+        # doing, not the user spamming, so those must never be throttled or
+        # only the first file of a batch would ever get processed.
+        if isinstance(event, Message) and event.media_group_id:
+            return await handler(event, data)
+
         user_id = None
         if isinstance(event, Message) and event.from_user:
             user_id = event.from_user.id
