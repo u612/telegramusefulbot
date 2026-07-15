@@ -21,6 +21,7 @@ python-magic==0.4.27
 PyMuPDF==1.23.26
 pypdf==4.0.1
 reportlab==4.0.9
+cryptography>=43.0.0
 
 # --- Images ---
 Pillow==10.2.0
