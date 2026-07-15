@@ -17,9 +17,6 @@ PDF_PDF_TO_IMAGES = "pdf_pdf_to_img"
 # Shared "I'm done uploading files" action for multi-file flows (merge, image->pdf)
 PDF_DONE = "pdf_done"
 
-# Merge queue status message: "keep sending" acknowledgement button
-PDF_MERGE_CONTINUE = "pdf_merge_continue"
-
 # Compression level choices
 PDF_COMPRESS_LOW = "pdf_cl_low"
 PDF_COMPRESS_MEDIUM = "pdf_cl_med"
@@ -73,13 +70,11 @@ def upload_done_keyboard() -> InlineKeyboardMarkup:
 
 def merge_queue_keyboard() -> InlineKeyboardMarkup:
     """Buttons shown on the single, repeatedly-edited Merge queue status
-    message: Continue Adding / Done / Cancel.
+    message: Done / Cancel. Users simply send more files to add them --
+    no separate "keep adding" acknowledgement button needed.
     """
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="➕ Continue Adding", callback_data=PDF_MERGE_CONTINUE),
-            InlineKeyboardButton(text="✅ Done", callback_data=PDF_DONE),
-        ],
+        [InlineKeyboardButton(text="✅ Done", callback_data=PDF_DONE)],
         [InlineKeyboardButton(text=const.CANCEL, callback_data=const.CB_CANCEL)],
     ])
 
