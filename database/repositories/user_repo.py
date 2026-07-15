@@ -62,6 +62,32 @@ class UserRepository:
             logger.exception(f"get_or_create failed for telegram_id={telegram_id}")
             raise
 
+    async def get_pdf_queue_limit(self, telegram_id: int) -> Optional[int]:
+        """Return the user's stored merge-queue limit, or None if the user
+        doesn't exist yet (caller should fall back to the default).
+        """
+        stmt = select(User.pdf_queue_limit).where(User.telegram_id == telegram_id)
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def set_pdf_queue_limit(self, telegram_id: int, limit: int) -> bool:
+        """Permanently set a user's merge-queue limit (owner-only /upgrade
+        command). Returns False if no such user exists yet.
+        """
+        try:
+            stmt = (
+                update(User)
+                .where(User.telegram_id == telegram_id)
+                .values(pdf_queue_limit=limit)
+            )
+            result = await self.session.execute(stmt)
+            await self.session.commit()
+            return result.rowcount > 0
+        except Exception:
+            await self.session.rollback()
+            logger.exception(f"set_pdf_queue_limit failed for telegram_id={telegram_id}")
+            raise
+
     async def increment_usage(self, telegram_id: int) -> None:
         """Atomically increment the usage counter for a user."""
         try:
@@ -76,4 +102,3 @@ class UserRepository:
             await self.session.rollback()
             logger.exception(f"increment_usage failed for telegram_id={telegram_id}")
             raise
-          
