@@ -2,7 +2,7 @@ from typing import Callable, Dict, Any, Awaitable
 from aiogram import BaseMiddleware
 from aiogram.types import TelegramObject, Message, CallbackQuery
 from database.session import AsyncSessionLocal
-from database.repositories import UserRepository
+from database.repositories import UserRepository, BotConfigRepository
 
 
 class DatabaseMiddleware(BaseMiddleware):
@@ -18,6 +18,7 @@ class DatabaseMiddleware(BaseMiddleware):
             # Store session in data
             data["db_session"] = session
             data["user_repo"] = UserRepository(session)
+            data["bot_config_repo"] = BotConfigRepository(session)
 
             # Get or create user if event has from_user
             user = None
@@ -37,4 +38,3 @@ class DatabaseMiddleware(BaseMiddleware):
                 data["db_user"] = db_user
 
             return await handler(event, data)
-          
