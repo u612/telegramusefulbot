@@ -43,6 +43,36 @@ class Settings(BaseSettings):
     # Railway injects PORT dynamically; 8000 is only a local-dev fallback.
     PORT: int = 8000
 
+    # --- Owner / admin ---
+    # Telegram numeric user id of the bot owner. 0 means "unset" -- no user
+    # gets owner privileges (unlimited merge queue, /upgrade, /userbot_on,
+    # /userbot_off, /status).
+    OWNER_ID: int = 0
+
+    # --- Merge: default queue size for non-upgraded users ---
+    DEFAULT_PDF_QUEUE_LIMIT: int = 20
+
+    # --- Optional userbot (MTProto) transport for large files ---
+    # All three must be set for userbot mode to be available at all; even
+    # then it stays OFF until the owner runs /userbot_on (see
+    # database.repositories.BotConfigRepository). This keeps a normal
+    # Bot-API-only deployment completely unaffected if these are left blank.
+    USERBOT_API_ID: Optional[int] = None
+    USERBOT_API_HASH: Optional[str] = None
+    USERBOT_SESSION_STRING: Optional[str] = None
+
+    # The public Telegram Bot API cannot download files above ~20 MB via
+    # getFile regardless of MAX_FILE_SIZE below -- this is a Telegram-side
+    # limit, not ours. Files at or above this size can only be fetched
+    # through the userbot transport. Kept slightly under the real 20 MB
+    # ceiling as a safety margin.
+    BOT_API_SAFE_DOWNLOAD_LIMIT: int = 19 * 1024 * 1024
+
+    # Ceiling for merge input/output file size when the userbot transport is
+    # active. When the userbot is not enabled, MAX_FILE_SIZE (Bot-API path)
+    # is still the effective ceiling.
+    MAX_FILE_SIZE_USERBOT: int = 200 * 1024 * 1024
+
     @field_validator("TEMP_FOLDER")
     @classmethod
     def ensure_temp_folder(cls, v: str) -> str:
@@ -59,4 +89,3 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
-
