@@ -31,6 +31,17 @@ CB_CANCEL = "cancel"
 # the "abandoned flow leaks temp files forever" bug.
 STATE_TEMP_FILES_KEY = "temp_files"
 
+# Merge queue: minimum gap between "Processing i/n" progress edits on the
+# single queue status message, so bursts of files (Telegram media groups)
+# don't trip flood limits by editing on every single file.
+MERGE_PROGRESS_EDIT_INTERVAL_SECONDS = 5.0
+
+# Merge queue: how long to wait after the last file in a burst before
+# finalizing the "✅ Added to Queue" edit. Telegram delivers a media group
+# as several back-to-back updates, not one atomic update, so this debounce
+# is what lets us treat them as a single batch.
+MERGE_BATCH_FINALIZE_DELAY_SECONDS = 1.2
+
 # Supported extensions
 SUPPORTED_PDF_EXTS = {".pdf"}
 SUPPORTED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".gif"}
