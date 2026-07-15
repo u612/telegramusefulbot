@@ -5,3 +5,4 @@ from .archive import router as archive_router
 from .document import router as document_router
 from .ocr import router as ocr_router
 from .settings import router as settings_router
+from .owner import router as owner_router
