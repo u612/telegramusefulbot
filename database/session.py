@@ -45,4 +45,23 @@ async def get_session() -> AsyncSession:
     """Dependency-style async generator for a DB session."""
     async with async_session() as session:
         yield session
-      
+
+
+async def run_light_migrations(conn) -> None:
+    """Additive, idempotent schema patch for columns/tables added after the
+    original deploy.
+
+    `Base.metadata.create_all` (called right before this in main.py's
+    lifespan) only creates tables that don't exist yet -- it never alters an
+    existing table, so a `users` table already sitting in a live Railway
+    Postgres DB would not gain new columns like `pdf_queue_limit` on its
+    own. `ADD COLUMN IF NOT EXISTS` is safe to run on every startup and
+    covers that gap without pulling in a full Alembic revision for one
+    column. Prefer a real Alembic migration for anything more involved than
+    this.
+    """
+    from sqlalchemy import text
+    await conn.execute(text(
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS pdf_queue_limit "
+        "INTEGER NOT NULL DEFAULT 20"
+    ))
