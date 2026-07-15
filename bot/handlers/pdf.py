@@ -26,7 +26,7 @@ from bot.keyboards.pdf import (
     get_pdf_menu,
     PDF_MERGE, PDF_SPLIT, PDF_COMPRESS, PDF_ROTATE, PDF_EXTRACT,
     PDF_REARRANGE, PDF_WATERMARK, PDF_ADD_PASSWORD, PDF_REMOVE_PASSWORD,
-    PDF_IMAGE_TO_PDF, PDF_PDF_TO_IMAGES, PDF_DONE, PDF_MERGE_CONTINUE,
+    PDF_IMAGE_TO_PDF, PDF_PDF_TO_IMAGES, PDF_DONE,
     upload_done_keyboard, compression_level_keyboard, rotate_angle_keyboard,
     pdf_to_images_format_keyboard, merge_queue_keyboard,
     PDF_COMPRESS_LOW, PDF_COMPRESS_MEDIUM, PDF_COMPRESS_HIGH,
@@ -401,11 +401,6 @@ async def pdf_merge_reject_wrong_input(message: Message):
     politely instead of ever crashing or silently ignoring it.
     """
     await message.answer("❌ Please send PDF files only.")
-
-
-@router.callback_query(PDFStates.waiting_for_files_merge, F.data == PDF_MERGE_CONTINUE)
-async def pdf_merge_continue(query: CallbackQuery):
-    await query.answer("Send more PDF files whenever you're ready.")
 
 
 @router.callback_query(PDFStates.waiting_for_files_merge, F.data == PDF_DONE)
