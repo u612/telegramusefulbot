@@ -40,7 +40,7 @@ from core.constants import (
 )
 from core.config import settings
 from core.logger import logger
-from utils.permissions import is_owner
+from utils.limits import get_effective_limits
 from services.telegram import get_transport
 
 from services.pdf.merger import PDFMerger
@@ -126,10 +126,15 @@ async def _download_and_validate(
     allowed_extensions: set,
     allowed_mime_types: set,
     kind_label: str,
+    db_user=None,
 ) -> Optional[str]:
     """Download the document attached to `message`, validate it, and track
     it for cleanup. Returns the temp path on success; on failure, replies
     with a user-facing error and returns None.
+
+    File-size limit is read from the caller's centralized effective limits
+    (utils.limits.get_effective_limits) -- the owner always gets `file_size
+    is None`, meaning no cap, here and everywhere else in the bot.
     """
     doc = message.document
     if doc is None:
@@ -138,12 +143,11 @@ async def _download_and_validate(
         )
         return None
 
-    owner = is_owner(message.from_user.id)
+    limits = get_effective_limits(message.from_user.id, db_user)
 
-    # Skip file size limit for owner
-    if not owner:
-        if doc.file_size and doc.file_size > settings.MAX_FILE_SIZE:
-            limit_mb = settings.MAX_FILE_SIZE // (1024 * 1024)
+    if not limits.unlimited:
+        if doc.file_size and doc.file_size > limits.file_size:
+            limit_mb = limits.file_size // (1024 * 1024)
             await message.answer(f"File too large (max {limit_mb} MB).")
             return None
 
@@ -179,7 +183,7 @@ async def _download_and_validate(
         doc.file_name or f"file{suffix}",
         allowed_extensions=allowed_extensions,
         allowed_mime_types=allowed_mime_types,
-        max_size=None if owner else settings.MAX_FILE_SIZE,
+        max_size=limits.file_size,
     )
 
     if error:
@@ -310,15 +314,6 @@ async def _finalize_merge_batch(bot, state: FSMContext, chat_id: int) -> None:
     )
 
 
-async def _get_merge_queue_limit(user_repo, telegram_id: int) -> int:
-    limit = settings.DEFAULT_PDF_QUEUE_LIMIT
-    if user_repo is not None:
-        stored = await user_repo.get_pdf_queue_limit(telegram_id)
-        if stored:
-            limit = stored
-    return limit
-
-
 # --------------------------------------------------------------------------
 # Merge (single queue status message, multi-file / media-group aware)
 # --------------------------------------------------------------------------
@@ -341,7 +336,7 @@ async def pdf_merge_start(query: CallbackQuery, state: FSMContext):
 
 
 @router.message(PDFStates.waiting_for_files_merge, F.document)
-async def pdf_merge_receive(message: Message, state: FSMContext, user_repo=None, bot_config_repo=None):
+async def pdf_merge_receive(message: Message, state: FSMContext, user_repo=None, bot_config_repo=None, db_user=None):
     doc = message.document
     user_id = message.from_user.id
 
@@ -352,19 +347,25 @@ async def pdf_merge_receive(message: Message, state: FSMContext, user_repo=None,
         return
 
     # Task 3: captions are never read here -- only the attached document.
-    owner = is_owner(user_id)
+    limits = get_effective_limits(user_id, db_user)
     current = await get_tracked_files(state)
-    if not owner:
-        limit = await _get_merge_queue_limit(user_repo, user_id)
-        if len(current) >= limit:
-            await message.answer(
-                f"You've reached your merge queue limit of {limit} PDFs. Press Done to merge, or Cancel."
-            )
-            return
+    if not limits.unlimited and len(current) >= limits.pdf_queue_limit:
+        await message.answer(
+            f"You've reached your merge queue limit of {limits.pdf_queue_limit} PDFs. "
+            f"Press Done to merge, or Cancel."
+        )
+        return
 
     userbot_enabled = bool(bot_config_repo) and await bot_config_repo.is_userbot_enabled()
-    size_ceiling = settings.MAX_FILE_SIZE_USERBOT if userbot_enabled else settings.MAX_FILE_SIZE
-    if doc.file_size and doc.file_size > size_ceiling:
+    # The owner is unlimited on file size everywhere, including Merge. For
+    # everyone else the ceiling still depends on which transport will be
+    # used (the userbot MTProto path supports much larger files than the
+    # plain Bot API) -- that's a technical capability, not a limit we
+    # impose, so it stays independent of the centralized limits.file_size.
+    size_ceiling = None if limits.unlimited else (
+        settings.MAX_FILE_SIZE_USERBOT if userbot_enabled else settings.MAX_FILE_SIZE
+    )
+    if size_ceiling is not None and doc.file_size and doc.file_size > size_ceiling:
         await message.answer(f"File too large (max {size_ceiling // (1024 * 1024)} MB).")
         return
 
@@ -507,8 +508,8 @@ async def pdf_split_start(query: CallbackQuery, state: FSMContext):
 
 
 @router.message(PDFStates.waiting_for_file_split, F.document)
-async def pdf_split_receive(message: Message, state: FSMContext):
-    path = await _download_and_validate(message, state, SUPPORTED_PDF_EXTS, _PDF_MIME, "PDF")
+async def pdf_split_receive(message: Message, state: FSMContext, db_user=None):
+    path = await _download_and_validate(message, state, SUPPORTED_PDF_EXTS, _PDF_MIME, "PDF", db_user=db_user)
     if path is None:
         return
     try:
@@ -538,9 +539,10 @@ async def pdf_split_process(message: Message, state: FSMContext, user_repo=None,
         return
 
     spec = None if message.text.strip().lower() == "all" else message.text.strip()
+    limits = get_effective_limits(message.from_user.id, db_user)
     await message.answer("Splitting... please wait.")
     try:
-        outputs = await PDFSplitter().split(path, spec)
+        outputs = await PDFSplitter().split(path, spec, max_groups=limits.pdf_split_limit)
     except Exception as e:
         await _fail(message, state, e, [path])
         return
@@ -591,16 +593,17 @@ async def pdf_compress_level_chosen(query: CallbackQuery, state: FSMContext):
 
 @router.message(PDFStates.waiting_for_file_compress, F.document)
 async def pdf_compress_process(message: Message, state: FSMContext, user_repo=None, db_user=None):
-    path = await _download_and_validate(message, state, SUPPORTED_PDF_EXTS, _PDF_MIME, "PDF")
+    path = await _download_and_validate(message, state, SUPPORTED_PDF_EXTS, _PDF_MIME, "PDF", db_user=db_user)
     if path is None:
         return
 
     data = await state.get_data()
     level = CompressionLevel(data.get("compress_level", CompressionLevel.MEDIUM.value))
+    limits = get_effective_limits(message.from_user.id, db_user)
 
     await message.answer("Compressing... please wait.")
     try:
-        output_path = await PDFCompressor().compress(path, level)
+        output_path = await PDFCompressor().compress(path, level, timeout=limits.subprocess_timeout)
     except Exception as e:
         await _fail(message, state, e, [path])
         return
@@ -635,7 +638,7 @@ async def pdf_rotate_angle_chosen(query: CallbackQuery, state: FSMContext):
 
 @router.message(PDFStates.waiting_for_file_rotate, F.document)
 async def pdf_rotate_process(message: Message, state: FSMContext, user_repo=None, db_user=None):
-    path = await _download_and_validate(message, state, SUPPORTED_PDF_EXTS, _PDF_MIME, "PDF")
+    path = await _download_and_validate(message, state, SUPPORTED_PDF_EXTS, _PDF_MIME, "PDF", db_user=db_user)
     if path is None:
         return
 
@@ -666,8 +669,8 @@ async def pdf_extract_start(query: CallbackQuery, state: FSMContext):
 
 
 @router.message(PDFStates.waiting_for_file_extract, F.document)
-async def pdf_extract_receive(message: Message, state: FSMContext):
-    path = await _download_and_validate(message, state, SUPPORTED_PDF_EXTS, _PDF_MIME, "PDF")
+async def pdf_extract_receive(message: Message, state: FSMContext, db_user=None):
+    path = await _download_and_validate(message, state, SUPPORTED_PDF_EXTS, _PDF_MIME, "PDF", db_user=db_user)
     if path is None:
         return
     try:
@@ -719,8 +722,8 @@ async def pdf_rearrange_start(query: CallbackQuery, state: FSMContext):
 
 
 @router.message(PDFStates.waiting_for_file_rearrange, F.document)
-async def pdf_rearrange_receive(message: Message, state: FSMContext):
-    path = await _download_and_validate(message, state, SUPPORTED_PDF_EXTS, _PDF_MIME, "PDF")
+async def pdf_rearrange_receive(message: Message, state: FSMContext, db_user=None):
+    path = await _download_and_validate(message, state, SUPPORTED_PDF_EXTS, _PDF_MIME, "PDF", db_user=db_user)
     if path is None:
         return
     try:
@@ -773,8 +776,8 @@ async def pdf_watermark_start(query: CallbackQuery, state: FSMContext):
 
 
 @router.message(PDFStates.waiting_for_file_watermark, F.document)
-async def pdf_watermark_receive(message: Message, state: FSMContext):
-    path = await _download_and_validate(message, state, SUPPORTED_PDF_EXTS, _PDF_MIME, "PDF")
+async def pdf_watermark_receive(message: Message, state: FSMContext, db_user=None):
+    path = await _download_and_validate(message, state, SUPPORTED_PDF_EXTS, _PDF_MIME, "PDF", db_user=db_user)
     if path is None:
         return
 
@@ -816,8 +819,8 @@ async def pdf_add_password_start(query: CallbackQuery, state: FSMContext):
 
 
 @router.message(PDFStates.waiting_for_file_password_add, F.document)
-async def pdf_add_password_receive(message: Message, state: FSMContext):
-    path = await _download_and_validate(message, state, SUPPORTED_PDF_EXTS, _PDF_MIME, "PDF")
+async def pdf_add_password_receive(message: Message, state: FSMContext, db_user=None):
+    path = await _download_and_validate(message, state, SUPPORTED_PDF_EXTS, _PDF_MIME, "PDF", db_user=db_user)
     if path is None:
         return
 
@@ -866,7 +869,7 @@ async def pdf_remove_password_start(query: CallbackQuery, state: FSMContext):
 
 
 @router.message(PDFStates.waiting_for_file_password_remove, F.document)
-async def pdf_remove_password_receive(message: Message, state: FSMContext):
+async def pdf_remove_password_receive(message: Message, state: FSMContext, db_user=None):
     # Note: this deliberately does NOT use _download_and_validate's usual
     # MIME/PdfReader-based path, because open_pdf_reader() rejects encrypted
     # PDFs by default -- exactly the files this flow needs to accept. Basic
@@ -875,8 +878,9 @@ async def pdf_remove_password_receive(message: Message, state: FSMContext):
     if doc is None:
         await message.answer("Please send a PDF file as a document.")
         return
-    if doc.file_size and doc.file_size > settings.MAX_FILE_SIZE:
-        limit_mb = settings.MAX_FILE_SIZE // (1024 * 1024)
+    limits = get_effective_limits(message.from_user.id, db_user)
+    if not limits.unlimited and doc.file_size and doc.file_size > limits.file_size:
+        limit_mb = limits.file_size // (1024 * 1024)
         await message.answer(f"File too large (max {limit_mb} MB).")
         return
     if not validate_extension(doc.file_name or "", SUPPORTED_PDF_EXTS):
@@ -919,18 +923,16 @@ async def pdf_remove_password_process(message: Message, state: FSMContext, user_
 
 @router.callback_query(F.data == PDF_IMAGE_TO_PDF)
 @router.message(PDFStates.waiting_for_images_to_pdf, F.photo)
-async def pdf_image_to_pdf_receive_photo(message: Message, state: FSMContext):
-    owner = is_owner(message.from_user.id)
+async def pdf_image_to_pdf_receive_photo(message: Message, state: FSMContext, db_user=None):
+    limits = get_effective_limits(message.from_user.id, db_user)
 
     current = await get_tracked_files(state)
 
-    # Unlimited images for owner
-    if not owner:
-        if len(current) >= settings.MAX_FILES_PER_BATCH:
-            await message.answer(
-                f"Maximum of {settings.MAX_FILES_PER_BATCH} images reached. Press 'Done'."
-            )
-            return
+    if not limits.unlimited and len(current) >= limits.image_to_pdf_limit:
+        await message.answer(
+            f"Maximum of {limits.image_to_pdf_limit} images reached. Press 'Done'."
+        )
+        return
 
     # Telegram compresses photos sent as "photo"; use the largest size.
     photo = message.photo[-1]
@@ -942,29 +944,25 @@ async def pdf_image_to_pdf_receive_photo(message: Message, state: FSMContext):
 
     count = len(await get_tracked_files(state))
 
-    if owner:
-        await message.answer(
-            f"Added image #{count}. Send more images or press 'Done'."
-        )
+    if limits.unlimited:
+        await message.answer(f"Added image #{count}. Send more images or press 'Done'.")
     else:
         await message.answer(
-            f"Added image {count}/{settings.MAX_FILES_PER_BATCH}. Send more or press 'Done'."
+            f"Added image {count}/{limits.image_to_pdf_limit}. Send more or press 'Done'."
         )
 
+
 @router.message(PDFStates.waiting_for_images_to_pdf, F.document)
-@router.message(PDFStates.waiting_for_images_to_pdf, F.document)
-async def pdf_image_to_pdf_receive_doc(message: Message, state: FSMContext):
-    owner = is_owner(message.from_user.id)
+async def pdf_image_to_pdf_receive_doc(message: Message, state: FSMContext, db_user=None):
+    limits = get_effective_limits(message.from_user.id, db_user)
 
     current = await get_tracked_files(state)
 
-    # Unlimited images for owner
-    if not owner:
-        if len(current) >= settings.MAX_FILES_PER_BATCH:
-            await message.answer(
-                f"Maximum of {settings.MAX_FILES_PER_BATCH} images reached. Press 'Done'."
-            )
-            return
+    if not limits.unlimited and len(current) >= limits.image_to_pdf_limit:
+        await message.answer(
+            f"Maximum of {limits.image_to_pdf_limit} images reached. Press 'Done'."
+        )
+        return
 
     path = await _download_and_validate(
         message,
@@ -972,6 +970,7 @@ async def pdf_image_to_pdf_receive_doc(message: Message, state: FSMContext):
         SUPPORTED_IMAGE_EXTS,
         _IMAGE_MIMES,
         "image",
+        db_user=db_user,
     )
 
     if path is None:
@@ -979,13 +978,11 @@ async def pdf_image_to_pdf_receive_doc(message: Message, state: FSMContext):
 
     count = len(await get_tracked_files(state))
 
-    if owner:
-        await message.answer(
-            f"Added image #{count}. Send more images or press 'Done'."
-        )
+    if limits.unlimited:
+        await message.answer(f"Added image #{count}. Send more images or press 'Done'.")
     else:
         await message.answer(
-            f"Added image {count}/{settings.MAX_FILES_PER_BATCH}. Send more or press 'Done'."
+            f"Added image {count}/{limits.image_to_pdf_limit}. Send more or press 'Done'."
         )
 
 @router.callback_query(PDFStates.waiting_for_images_to_pdf, F.data == PDF_DONE)
@@ -996,9 +993,10 @@ async def pdf_image_to_pdf_done(query: CallbackQuery, state: FSMContext, user_re
         await query.message.answer("Send at least one image first, or press Cancel.")
         return
 
+    limits = get_effective_limits(query.from_user.id, db_user)
     await query.message.answer("Converting... please wait.")
     try:
-        output_path = await ImageToPDF().convert(images)
+        output_path = await ImageToPDF().convert(images, max_images=limits.image_to_pdf_limit)
     except Exception as e:
         await _fail(query.message, state, e, images)
         return
@@ -1032,7 +1030,7 @@ async def pdf_to_images_format_chosen(query: CallbackQuery, state: FSMContext):
 
 @router.message(PDFStates.waiting_for_file_pdf_to_images, F.document)
 async def pdf_to_images_process(message: Message, state: FSMContext, user_repo=None, db_user=None):
-    path = await _download_and_validate(message, state, SUPPORTED_PDF_EXTS, _PDF_MIME, "PDF")
+    path = await _download_and_validate(message, state, SUPPORTED_PDF_EXTS, _PDF_MIME, "PDF", db_user=db_user)
     if path is None:
         return
 
