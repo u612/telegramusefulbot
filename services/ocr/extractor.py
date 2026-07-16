@@ -30,19 +30,27 @@ class OCRProcessingError(RuntimeError):
 
 
 class OCRExtractor:
-    async def extract_text(self, input_path: str, lang: str = "eng") -> str:
+    async def extract_text(self, input_path: str, lang: str = "eng", timeout=None) -> str:
+        """`timeout` should come from the caller's effective limits
+        (utils.limits) -- pass None for no timeout (the owner is never
+        subject to a processing-time cap). Defaults to settings.OCR_TIMEOUT
+        when omitted, for any caller that hasn't been updated yet.
+        """
         if shutil.which("tesseract") is None:
             raise OCRProcessingError("OCR is currently unavailable on this server (Tesseract not installed).")
         if lang not in SUPPORTED_LANGUAGES:
             raise OCRProcessingError(f"Unsupported language. Choose one of: {', '.join(SUPPORTED_LANGUAGES)}")
 
+        effective_timeout = timeout if timeout is not None else settings.OCR_TIMEOUT
+        if effective_timeout is None:
+            return await asyncio.to_thread(self._extract_sync, input_path, lang)
         try:
             return await asyncio.wait_for(
                 asyncio.to_thread(self._extract_sync, input_path, lang),
-                timeout=settings.OCR_TIMEOUT,
+                timeout=effective_timeout,
             )
         except asyncio.TimeoutError:
-            raise OCRProcessingError(f"OCR timed out after {settings.OCR_TIMEOUT}s.")
+            raise OCRProcessingError(f"OCR timed out after {effective_timeout}s.")
 
     @staticmethod
     def _extract_sync(input_path: str, lang: str) -> str:
