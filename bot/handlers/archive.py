@@ -21,8 +21,16 @@ from services.archive.extractor import ArchiveExtractor, MAX_EXTRACTED_FILES_TO_
 from services.archive._common import ArchiveProcessingError
 from services.security.validator import ArchiveSecurityError
 
-from utils.tempfiles import new_temp_path, track_temp_file, untrack_temp_files, get_tracked_files, delete_paths, delete_path
+from utils.tempfiles import (
+    new_temp_path,
+    track_temp_file,
+    untrack_temp_files,
+    get_tracked_files,
+    delete_paths,
+    delete_path,
+)
 from utils.validators import validate_extension
+from utils.permissions import is_owner
 
 router = Router()
 
@@ -85,30 +93,58 @@ async def arc_compress_format_chosen(query: CallbackQuery, state: FSMContext):
 
 @router.message(ArchiveStates.waiting_for_files_compress, F.document)
 async def arc_compress_receive(message: Message, state: FSMContext):
+    owner = is_owner(message.from_user.id)
+
     current = await get_tracked_files(state)
-    if len(current) >= settings.MAX_FILES_PER_BATCH:
-        await message.answer(f"Maximum of {settings.MAX_FILES_PER_BATCH} files reached. Press 'Done'.")
-        return
+
+    # Unlimited number of files for owner
+    if not owner:
+        if len(current) >= settings.MAX_FILES_PER_BATCH:
+            await message.answer(
+                f"Maximum of {settings.MAX_FILES_PER_BATCH} files reached. Press 'Done'."
+            )
+            return
 
     doc = message.document
-    if doc.file_size and doc.file_size > settings.MAX_FILE_SIZE:
-        limit_mb = settings.MAX_FILE_SIZE // (1024 * 1024)
-        await message.answer(f"File too large (max {limit_mb} MB).")
-        return
 
-    suffix = "." + (doc.file_name or "").rsplit(".", 1)[-1].lower() if "." in (doc.file_name or "") else ""
-    # Preserve the original basename inside the archive for a nicer result,
-    # while still writing to a collision-proof temp path on disk.
+    # Unlimited file size for owner
+    if not owner:
+        if doc.file_size and doc.file_size > settings.MAX_FILE_SIZE:
+            limit_mb = settings.MAX_FILE_SIZE // (1024 * 1024)
+            await message.answer(f"File too large (max {limit_mb} MB).")
+            return
+
+    suffix = (
+        "." + (doc.file_name or "").rsplit(".", 1)[-1].lower()
+        if "." in (doc.file_name or "")
+        else ""
+    )
+
+    # Preserve the original basename inside the archive
     temp_path = new_temp_path(suffix=suffix)
+
     await track_temp_file(state, temp_path)
-    await message.bot.download(doc, destination=temp_path)
+
+    await message.bot.download(
+        doc,
+        destination=temp_path,
+    )
 
     names = (await state.get_data()).get("original_names", {})
     names[temp_path] = doc.file_name or f"file{suffix}"
+
     await state.update_data(original_names=names)
 
     count = len(await get_tracked_files(state))
-    await message.answer(f"Added file {count}/{settings.MAX_FILES_PER_BATCH}. Send more or press 'Done'.")
+
+    if owner:
+        await message.answer(
+            f"Added file #{count}. Send more files or press 'Done'."
+        )
+    else:
+        await message.answer(
+            f"Added file {count}/{settings.MAX_FILES_PER_BATCH}. Send more or press 'Done'."
+        )
 
 
 @router.callback_query(ArchiveStates.waiting_for_files_compress, F.data == ARC_DONE)
