@@ -7,12 +7,12 @@ from bot.states.ocr import OCRStates
 from bot.keyboards.ocr import get_ocr_menu, OCR_START, OCR_LANG_PREFIX, ocr_language_keyboard
 from bot.keyboards.common import back_home_cancel
 from core.constants import CB_OCR, SUPPORTED_IMAGE_EXTS
-from core.config import settings
 from core.logger import logger
 
 from services.ocr.extractor import OCRExtractor, OCRProcessingError, SUPPORTED_LANGUAGES
 from utils.tempfiles import new_temp_path, track_temp_file, untrack_temp_files, delete_paths
 from utils.validators import validate_extension, validate_upload
+from utils.limits import get_effective_limits
 
 router = Router()
 
@@ -65,8 +65,9 @@ async def ocr_process(message: Message, state: FSMContext, user_repo=None, db_us
     if doc is None:
         await message.answer("Please send an image file as a document.")
         return
-    if doc.file_size and doc.file_size > settings.MAX_FILE_SIZE:
-        limit_mb = settings.MAX_FILE_SIZE // (1024 * 1024)
+    limits = get_effective_limits(message.from_user.id, db_user)
+    if not limits.unlimited and doc.file_size and doc.file_size > limits.file_size:
+        limit_mb = limits.file_size // (1024 * 1024)
         await message.answer(f"File too large (max {limit_mb} MB).")
         return
     if not validate_extension(doc.file_name or "", SUPPORTED_IMAGE_EXTS):
@@ -79,7 +80,10 @@ async def ocr_process(message: Message, state: FSMContext, user_repo=None, db_us
     await track_temp_file(state, path)
     await message.bot.download(doc, destination=path)
 
-    error = validate_upload(path, doc.file_name or f"file{suffix}", SUPPORTED_IMAGE_EXTS, _IMAGE_MIMES)
+    error = validate_upload(
+        path, doc.file_name or f"file{suffix}", SUPPORTED_IMAGE_EXTS, _IMAGE_MIMES,
+        max_size=limits.file_size,
+    )
     if error:
         delete_paths([path])
         await untrack_temp_files(state, [path])
@@ -92,7 +96,7 @@ async def ocr_process(message: Message, state: FSMContext, user_repo=None, db_us
 
     await message.answer("Extracting text... please wait.")
     try:
-        text = await OCRExtractor().extract_text(path, lang)
+        text = await OCRExtractor().extract_text(path, lang, timeout=limits.ocr_timeout)
     except OCRProcessingError as e:
         await message.answer(f"⚠️ {e}")
         delete_paths([path])
