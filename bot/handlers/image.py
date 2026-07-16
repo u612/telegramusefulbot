@@ -21,8 +21,8 @@ from bot.keyboards.image import (
 )
 from bot.keyboards.common import back_home_cancel
 from core.constants import CB_IMAGE, SUPPORTED_IMAGE_EXTS
-from core.config import settings
 from core.logger import logger
+from utils.limits import get_effective_limits
 
 from services.image.compressor import ImageCompressor, CompressionLevel
 from services.image.resizer import ImageResizer
@@ -61,7 +61,7 @@ async def _track_usage(user_repo, db_user) -> None:
             logger.exception("Failed to increment usage counter (non-fatal).")
 
 
-async def _download_and_validate_image(message: Message, state: FSMContext) -> Optional[str]:
+async def _download_and_validate_image(message: Message, state: FSMContext, db_user=None) -> Optional[str]:
     doc = message.document
     if doc is None:
         if message.photo:
@@ -73,8 +73,9 @@ async def _download_and_validate_image(message: Message, state: FSMContext) -> O
             await message.answer("Please send an image file as a document.")
         return None
 
-    if doc.file_size and doc.file_size > settings.MAX_FILE_SIZE:
-        limit_mb = settings.MAX_FILE_SIZE // (1024 * 1024)
+    limits = get_effective_limits(message.from_user.id, db_user)
+    if not limits.unlimited and doc.file_size and doc.file_size > limits.file_size:
+        limit_mb = limits.file_size // (1024 * 1024)
         await message.answer(f"File too large (max {limit_mb} MB).")
         return None
 
@@ -100,6 +101,7 @@ async def _download_and_validate_image(message: Message, state: FSMContext) -> O
         temp_path, doc.file_name or f"file{suffix}",
         allowed_extensions=SUPPORTED_IMAGE_EXTS,
         allowed_mime_types=_IMAGE_MIMES,
+        max_size=limits.file_size,
     )
     if error:
         await untrack_temp_files(state, [temp_path])
@@ -160,7 +162,7 @@ async def img_compress_level_chosen(query: CallbackQuery, state: FSMContext):
 
 @router.message(ImageStates.waiting_for_file_compress, F.document)
 async def img_compress_process(message: Message, state: FSMContext, user_repo=None, db_user=None):
-    path = await _download_and_validate_image(message, state)
+    path = await _download_and_validate_image(message, state, db_user=db_user)
     if path is None:
         return
     data = await state.get_data()
@@ -191,8 +193,8 @@ async def img_resize_start(query: CallbackQuery, state: FSMContext):
 
 
 @router.message(ImageStates.waiting_for_file_resize, F.document)
-async def img_resize_receive(message: Message, state: FSMContext):
-    path = await _download_and_validate_image(message, state)
+async def img_resize_receive(message: Message, state: FSMContext, db_user=None):
+    path = await _download_and_validate_image(message, state, db_user=db_user)
     if path is None:
         return
     await state.update_data(resize_input_path=path)
@@ -238,8 +240,8 @@ async def img_crop_start(query: CallbackQuery, state: FSMContext):
 
 
 @router.message(ImageStates.waiting_for_file_crop, F.document)
-async def img_crop_receive(message: Message, state: FSMContext):
-    path = await _download_and_validate_image(message, state)
+async def img_crop_receive(message: Message, state: FSMContext, db_user=None):
+    path = await _download_and_validate_image(message, state, db_user=db_user)
     if path is None:
         return
     await state.update_data(crop_input_path=path)
@@ -297,7 +299,7 @@ async def img_rotate_angle_chosen(query: CallbackQuery, state: FSMContext):
 
 @router.message(ImageStates.waiting_for_file_rotate, F.document)
 async def img_rotate_process(message: Message, state: FSMContext, user_repo=None, db_user=None):
-    path = await _download_and_validate_image(message, state)
+    path = await _download_and_validate_image(message, state, db_user=db_user)
     if path is None:
         return
     data = await state.get_data()
@@ -338,7 +340,7 @@ async def img_flip_direction_chosen(query: CallbackQuery, state: FSMContext):
 
 @router.message(ImageStates.waiting_for_file_flip, F.document)
 async def img_flip_process(message: Message, state: FSMContext, user_repo=None, db_user=None):
-    path = await _download_and_validate_image(message, state)
+    path = await _download_and_validate_image(message, state, db_user=db_user)
     if path is None:
         return
     data = await state.get_data()
@@ -385,7 +387,7 @@ async def img_convert_format_chosen(query: CallbackQuery, state: FSMContext):
 
 @router.message(ImageStates.waiting_for_file_convert, F.document)
 async def img_convert_process(message: Message, state: FSMContext, user_repo=None, db_user=None):
-    path = await _download_and_validate_image(message, state)
+    path = await _download_and_validate_image(message, state, db_user=db_user)
     if path is None:
         return
     data = await state.get_data()
@@ -421,7 +423,7 @@ async def img_bg_remove_start(query: CallbackQuery, state: FSMContext):
 
 @router.message(ImageStates.waiting_for_file_bg_remove, F.document)
 async def img_bg_remove_process(message: Message, state: FSMContext, user_repo=None, db_user=None):
-    path = await _download_and_validate_image(message, state)
+    path = await _download_and_validate_image(message, state, db_user=db_user)
     if path is None:
         return
 
@@ -449,8 +451,8 @@ async def img_watermark_start(query: CallbackQuery, state: FSMContext):
 
 
 @router.message(ImageStates.waiting_for_file_watermark, F.document)
-async def img_watermark_receive(message: Message, state: FSMContext):
-    path = await _download_and_validate_image(message, state)
+async def img_watermark_receive(message: Message, state: FSMContext, db_user=None):
+    path = await _download_and_validate_image(message, state, db_user=db_user)
     if path is None:
         return
     await state.update_data(watermark_input_path=path)
@@ -493,7 +495,7 @@ async def img_metadata_remove_start(query: CallbackQuery, state: FSMContext):
 
 @router.message(ImageStates.waiting_for_file_metadata_remove, F.document)
 async def img_metadata_remove_process(message: Message, state: FSMContext, user_repo=None, db_user=None):
-    path = await _download_and_validate_image(message, state)
+    path = await _download_and_validate_image(message, state, db_user=db_user)
     if path is None:
         return
 
