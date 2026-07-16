@@ -98,7 +98,8 @@ async def lifespan(app: FastAPI):
                 [
                     BotCommand(command="start", description="Start the bot"),
                     BotCommand(command="cancel", description="Cancel current operation"),
-                    BotCommand(command="upgrade", description="Raise a user's merge queue limit"),
+                    BotCommand(command="upgrade", description="Raise a user's limit: /upgrade <id> <feature> <limit>"),
+                    BotCommand(command="limits", description="Show a user's effective limits"),
                     BotCommand(command="userbot_on", description="Enable the userbot large-file transport"),
                     BotCommand(command="userbot_off", description="Disable the userbot large-file transport"),
                     BotCommand(command="status", description="Show bot/userbot status"),
