@@ -133,20 +133,33 @@ async def _download_and_validate(
     """
     doc = message.document
     if doc is None:
-        await message.answer(f"Please send a {kind_label} file as a document (not a photo).")
+        await message.answer(
+            f"Please send a {kind_label} file as a document (not a photo)."
+        )
         return None
 
-    if doc.file_size and doc.file_size > settings.MAX_FILE_SIZE:
-        limit_mb = settings.MAX_FILE_SIZE // (1024 * 1024)
-        await message.answer(f"File too large (max {limit_mb} MB).")
-        return None
+    owner = is_owner(message.from_user.id)
+
+    # Skip file size limit for owner
+    if not owner:
+        if doc.file_size and doc.file_size > settings.MAX_FILE_SIZE:
+            limit_mb = settings.MAX_FILE_SIZE // (1024 * 1024)
+            await message.answer(f"File too large (max {limit_mb} MB).")
+            return None
 
     if not validate_extension(doc.file_name or "", allowed_extensions):
         allowed_str = ", ".join(sorted(allowed_extensions))
-        await message.answer(f"Unsupported file type. Allowed: {allowed_str}")
+        await message.answer(
+            f"Unsupported file type. Allowed: {allowed_str}"
+        )
         return None
 
-    suffix = "." + (doc.file_name or "").rsplit(".", 1)[-1].lower() if "." in (doc.file_name or "") else ""
+    suffix = (
+        "." + (doc.file_name or "").rsplit(".", 1)[-1].lower()
+        if "." in (doc.file_name or "")
+        else ""
+    )
+
     temp_path = new_temp_path(suffix=suffix)
     await track_temp_file(state, temp_path)
 
@@ -156,14 +169,19 @@ async def _download_and_validate(
         logger.error(f"Download failed: {e}")
         await untrack_temp_files(state, [temp_path])
         delete_paths([temp_path])
-        await message.answer("Failed to download the file from Telegram. Please try again.")
+        await message.answer(
+            "Failed to download the file from Telegram. Please try again."
+        )
         return None
 
     error = validate_upload(
-        temp_path, doc.file_name or f"file{suffix}",
+        temp_path,
+        doc.file_name or f"file{suffix}",
         allowed_extensions=allowed_extensions,
         allowed_mime_types=allowed_mime_types,
+        max_size=None if owner else settings.MAX_FILE_SIZE,
     )
+
     if error:
         await untrack_temp_files(state, [temp_path])
         delete_paths([temp_path])
@@ -900,47 +918,75 @@ async def pdf_remove_password_process(message: Message, state: FSMContext, user_
 # --------------------------------------------------------------------------
 
 @router.callback_query(F.data == PDF_IMAGE_TO_PDF)
-async def pdf_image_to_pdf_start(query: CallbackQuery, state: FSMContext):
-    await state.set_state(PDFStates.waiting_for_images_to_pdf)
-    await query.message.edit_text(
-        "Send the images you want combined into a PDF, in order.\n"
-        f"Up to {settings.MAX_FILES_PER_BATCH} images. Press 'Done' when finished.",
-        reply_markup=upload_done_keyboard(),
-    )
-    await query.answer()
-
-
 @router.message(PDFStates.waiting_for_images_to_pdf, F.photo)
 async def pdf_image_to_pdf_receive_photo(message: Message, state: FSMContext):
-    # Telegram compresses photos sent as "photo"; use the largest size.
-    current = await get_tracked_files(state)
-    if len(current) >= settings.MAX_FILES_PER_BATCH:
-        await message.answer(f"Maximum of {settings.MAX_FILES_PER_BATCH} images reached. Press 'Done'.")
-        return
+    owner = is_owner(message.from_user.id)
 
+    current = await get_tracked_files(state)
+
+    # Unlimited images for owner
+    if not owner:
+        if len(current) >= settings.MAX_FILES_PER_BATCH:
+            await message.answer(
+                f"Maximum of {settings.MAX_FILES_PER_BATCH} images reached. Press 'Done'."
+            )
+            return
+
+    # Telegram compresses photos sent as "photo"; use the largest size.
     photo = message.photo[-1]
+
     path = new_temp_path(suffix=".jpg")
     await track_temp_file(state, path)
+
     await message.bot.download(photo, destination=path)
 
     count = len(await get_tracked_files(state))
-    await message.answer(f"Added image {count}/{settings.MAX_FILES_PER_BATCH}. Send more or press 'Done'.")
 
+    if owner:
+        await message.answer(
+            f"Added image #{count}. Send more images or press 'Done'."
+        )
+    else:
+        await message.answer(
+            f"Added image {count}/{settings.MAX_FILES_PER_BATCH}. Send more or press 'Done'."
+        )
 
 @router.message(PDFStates.waiting_for_images_to_pdf, F.document)
+@router.message(PDFStates.waiting_for_images_to_pdf, F.document)
 async def pdf_image_to_pdf_receive_doc(message: Message, state: FSMContext):
-    current = await get_tracked_files(state)
-    if len(current) >= settings.MAX_FILES_PER_BATCH:
-        await message.answer(f"Maximum of {settings.MAX_FILES_PER_BATCH} images reached. Press 'Done'.")
-        return
+    owner = is_owner(message.from_user.id)
 
-    path = await _download_and_validate(message, state, SUPPORTED_IMAGE_EXTS, _IMAGE_MIMES, "image")
+    current = await get_tracked_files(state)
+
+    # Unlimited images for owner
+    if not owner:
+        if len(current) >= settings.MAX_FILES_PER_BATCH:
+            await message.answer(
+                f"Maximum of {settings.MAX_FILES_PER_BATCH} images reached. Press 'Done'."
+            )
+            return
+
+    path = await _download_and_validate(
+        message,
+        state,
+        SUPPORTED_IMAGE_EXTS,
+        _IMAGE_MIMES,
+        "image",
+    )
+
     if path is None:
         return
 
     count = len(await get_tracked_files(state))
-    await message.answer(f"Added image {count}/{settings.MAX_FILES_PER_BATCH}. Send more or press 'Done'.")
 
+    if owner:
+        await message.answer(
+            f"Added image #{count}. Send more images or press 'Done'."
+        )
+    else:
+        await message.answer(
+            f"Added image {count}/{settings.MAX_FILES_PER_BATCH}. Send more or press 'Done'."
+        )
 
 @router.callback_query(PDFStates.waiting_for_images_to_pdf, F.data == PDF_DONE)
 async def pdf_image_to_pdf_done(query: CallbackQuery, state: FSMContext, user_repo=None, db_user=None):
