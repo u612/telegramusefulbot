@@ -13,16 +13,20 @@ from services.pdf._common import PDFProcessingError, open_pdf_reader, check_page
 
 
 class PDFSplitter:
-    async def split(self, input_path: str, ranges_spec: Optional[str] = None) -> List[str]:
+    async def split(
+        self, input_path: str, ranges_spec: Optional[str] = None, max_groups: Optional[int] = None
+    ) -> List[str]:
         """If `ranges_spec` is None, splits into one PDF per page. Otherwise
         `ranges_spec` is a ';'-separated list of page-range groups (e.g.
         '1-3;4-6;7'), and each group becomes one output PDF.
+        `max_groups` should come from the caller's effective limits
+        (utils.limits) -- pass None (or omit) for no cap, i.e. the owner.
         Returns a list of output file paths, in order.
         """
-        return await asyncio.to_thread(self._split_sync, input_path, ranges_spec)
+        return await asyncio.to_thread(self._split_sync, input_path, ranges_spec, max_groups)
 
     @staticmethod
-    def _split_sync(input_path: str, ranges_spec: Optional[str]) -> List[str]:
+    def _split_sync(input_path: str, ranges_spec: Optional[str], max_groups: Optional[int]) -> List[str]:
         reader = open_pdf_reader(input_path)
         total_pages = check_page_count(reader, min_pages=2)
 
@@ -34,8 +38,8 @@ class PDFSplitter:
         else:
             groups = [[i] for i in range(total_pages)]
 
-        if len(groups) > 200:
-            raise PDFProcessingError("Too many split groups requested (max 200).")
+        if max_groups is not None and len(groups) > max_groups:
+            raise PDFProcessingError(f"Too many split groups requested (max {max_groups}).")
 
         output_paths: List[str] = []
         try:
