@@ -7,8 +7,7 @@ from PIL import Image, UnidentifiedImageError
 from core.logger import logger
 from utils.tempfiles import new_temp_path
 from services.pdf._common import PDFProcessingError
-
-MAX_IMAGES = 50
+from typing import Optional
 
 
 def _load_as_rgb(path: str) -> Image.Image:
@@ -31,11 +30,14 @@ def _load_as_rgb(path: str) -> Image.Image:
 
 
 class ImageToPDF:
-    async def convert(self, image_paths: List[str]) -> str:
+    async def convert(self, image_paths: List[str], max_images: Optional[int] = None) -> str:
+        """`max_images` should come from the caller's effective limits
+        (utils.limits) -- pass None (or omit) for no cap, i.e. the owner.
+        """
         if not image_paths:
             raise PDFProcessingError("No images provided.")
-        if len(image_paths) > MAX_IMAGES:
-            raise PDFProcessingError(f"Too many images (max {MAX_IMAGES}).")
+        if max_images is not None and len(image_paths) > max_images:
+            raise PDFProcessingError(f"Too many images (max {max_images}).")
         return await asyncio.to_thread(self._convert_sync, image_paths)
 
     @staticmethod
