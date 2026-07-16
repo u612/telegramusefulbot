@@ -24,9 +24,16 @@ _GS_SETTINGS = {
 }
 
 
+_UNSET = object()
+
+
 class PDFCompressor:
-    async def compress(self, input_path: str, level: CompressionLevel = CompressionLevel.MEDIUM) -> str:
-        """Returns the path to a compressed copy of the PDF."""
+    async def compress(self, input_path: str, level: CompressionLevel = CompressionLevel.MEDIUM, timeout=_UNSET) -> str:
+        """Returns the path to a compressed copy of the PDF. `timeout`
+        should come from the caller's effective limits (utils.limits) --
+        pass None explicitly for no timeout (the owner). Omitting it falls
+        back to settings.SUBPROCESS_TIMEOUT.
+        """
         if shutil.which("gs") is None:
             raise PDFProcessingError(
                 "PDF compression is currently unavailable on this server (Ghostscript not installed)."
@@ -52,7 +59,10 @@ class PDFCompressor:
         ]
 
         try:
-            await run_subprocess_safe(cmd, timeout=settings.SUBPROCESS_TIMEOUT)
+            if timeout is _UNSET:
+                await run_subprocess_safe(cmd)
+            else:
+                await run_subprocess_safe(cmd, timeout=timeout)
         except SubprocessError as e:
             delete_path(output_path)
             raise PDFProcessingError(f"Compression failed: {e}")
