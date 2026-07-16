@@ -35,17 +35,24 @@ def _get_semaphore() -> asyncio.Semaphore:
 
 
 class DocumentConverter:
-    async def convert_to_pdf(self, input_path: str) -> str:
+    async def convert_to_pdf(self, input_path: str, timeout=None) -> str:
+        """`timeout` should come from the caller's effective limits
+        (utils.limits) -- pass None for no timeout (the owner is never
+        subject to a processing-time cap). Falls back to
+        settings.LIBREOFFICE_TIMEOUT when omitted, for callers not yet
+        updated to pass one explicitly.
+        """
         if shutil.which("soffice") is None:
             raise DocumentProcessingError(
                 "Document conversion is currently unavailable on this server (LibreOffice not installed)."
             )
 
+        effective_timeout = timeout if timeout is not None else settings.LIBREOFFICE_TIMEOUT
         async with _get_semaphore():
-            return await asyncio.to_thread(self._convert_sync, input_path)
+            return await asyncio.to_thread(self._convert_sync, input_path, effective_timeout)
 
     @staticmethod
-    def _convert_sync(input_path: str) -> str:
+    def _convert_sync(input_path: str, timeout) -> str:
         profile_dir = new_temp_dir(prefix="lo_profile_")
         out_dir = new_temp_dir(prefix="lo_out_")
         try:
@@ -66,11 +73,11 @@ class DocumentConverter:
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    timeout=settings.LIBREOFFICE_TIMEOUT,
+                    timeout=timeout,  # None (owner) means "wait indefinitely"
                 )
             except subprocess.TimeoutExpired:
                 raise DocumentProcessingError(
-                    f"Conversion timed out after {settings.LIBREOFFICE_TIMEOUT}s."
+                    f"Conversion timed out after {timeout}s."
                 )
             if result.returncode != 0:
                 stderr = result.stderr.decode("utf-8", errors="replace")[:500]
