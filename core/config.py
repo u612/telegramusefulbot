@@ -52,6 +52,16 @@ class Settings(BaseSettings):
     # --- Merge: default queue size for non-upgraded users ---
     DEFAULT_PDF_QUEUE_LIMIT: int = 20
 
+    # --- Per-feature defaults for non-upgraded, non-owner users ---
+    # These are the fallback values used by utils.limits.get_effective_limits
+    # whenever a user has no personal override stored in the database. The
+    # owner always bypasses every one of these (see utils.permissions.is_owner
+    # and utils.limits.get_effective_limits).
+    DEFAULT_ARCHIVE_COMPRESS_LIMIT: int = 50
+    DEFAULT_ARCHIVE_EXTRACT_RETURN_LIMIT: int = 20
+    DEFAULT_IMAGE_TO_PDF_LIMIT: int = 50
+    DEFAULT_PDF_SPLIT_LIMIT: int = 200
+
     # --- Optional userbot (MTProto) transport for large files ---
     # All three must be set for userbot mode to be available at all; even
     # then it stays OFF until the owner runs /userbot_on (see
@@ -80,7 +90,12 @@ class Settings(BaseSettings):
         os.makedirs(v, exist_ok=True)
         return v
 
-    @field_validator("MAX_FILE_SIZE", "MAX_FILES_PER_BATCH", "MAX_CONCURRENT_HEAVY_JOBS")
+    @field_validator(
+        "MAX_FILE_SIZE", "MAX_FILES_PER_BATCH", "MAX_CONCURRENT_HEAVY_JOBS",
+        "DEFAULT_PDF_QUEUE_LIMIT", "DEFAULT_ARCHIVE_COMPRESS_LIMIT",
+        "DEFAULT_ARCHIVE_EXTRACT_RETURN_LIMIT", "DEFAULT_IMAGE_TO_PDF_LIMIT",
+        "DEFAULT_PDF_SPLIT_LIMIT",
+    )
     @classmethod
     def ensure_positive(cls, v: int) -> int:
         if v <= 0:
