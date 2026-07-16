@@ -65,3 +65,17 @@ async def run_light_migrations(conn) -> None:
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS pdf_queue_limit "
         "INTEGER NOT NULL DEFAULT 20"
     ))
+    # Centralized per-user limit overrides (utils.limits.FEATURE_LIMITS).
+    # All nullable -- NULL means "no personal override, use the settings
+    # default" (see utils.limits.get_effective_limits).
+    for column in (
+        "file_size_limit",
+        "batch_limit",
+        "archive_compress_limit",
+        "archive_extract_return_limit",
+        "image_to_pdf_limit",
+        "pdf_split_limit",
+    ):
+        await conn.execute(text(
+            f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {column} INTEGER"
+        ))
