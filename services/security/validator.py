@@ -59,14 +59,23 @@ class SubprocessError(RuntimeError):
     """Raised when an external tool invocation fails or times out."""
 
 
+_UNSET = object()
+
+
 async def run_subprocess_safe(
     cmd: List[str],
-    timeout: Optional[int] = None,
+    timeout=_UNSET,
     cwd: Optional[str] = None,
 ) -> Tuple[str, str]:
     """Run an external command safely: argv list only (never shell=True, so
     there is no shell-injection surface), with an enforced timeout that
     kills the process group on expiry instead of leaving it running.
+
+    `timeout` should come from the caller's effective limits
+    (utils.limits) -- pass `None` explicitly for NO timeout (the owner is
+    never subject to a processing-time cap). Omitting it falls back to
+    `settings.SUBPROCESS_TIMEOUT` for any caller not yet updated to pass
+    one explicitly.
 
     Returns (stdout, stderr) as text. Raises SubprocessError on non-zero
     exit or timeout.
@@ -74,7 +83,8 @@ async def run_subprocess_safe(
     if not cmd or not isinstance(cmd, list):
         raise ValueError("cmd must be a non-empty list of argv strings")
 
-    timeout = timeout or settings.SUBPROCESS_TIMEOUT
+    if timeout is _UNSET:
+        timeout = settings.SUBPROCESS_TIMEOUT
     logger.debug(f"Running subprocess: {cmd!r} (timeout={timeout}s)")
 
     proc = await asyncio.create_subprocess_exec(
