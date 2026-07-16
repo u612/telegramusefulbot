@@ -1,5 +1,5 @@
 """Handlers for Archive Compress and Extract."""
-from typing import Optional
+import os
 
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, FSInputFile
@@ -13,11 +13,10 @@ from bot.keyboards.archive import (
 )
 from bot.keyboards.common import back_home_cancel
 from core.constants import CB_ARCHIVE, SUPPORTED_ARCHIVE_EXTS
-from core.config import settings
 from core.logger import logger
 
 from services.archive.compressor import ArchiveCompressor, ArchiveFormat
-from services.archive.extractor import ArchiveExtractor, MAX_EXTRACTED_FILES_TO_RETURN
+from services.archive.extractor import ArchiveExtractor
 from services.archive._common import ArchiveProcessingError
 from services.security.validator import ArchiveSecurityError
 
@@ -27,10 +26,9 @@ from utils.tempfiles import (
     untrack_temp_files,
     get_tracked_files,
     delete_paths,
-    delete_path,
 )
 from utils.validators import validate_extension
-from utils.permissions import is_owner
+from utils.limits import get_effective_limits, format_limit
 
 router = Router()
 
@@ -69,9 +67,11 @@ async def _fail(message: Message, state: FSMContext, error: Exception, cleanup_p
 # --------------------------------------------------------------------------
 
 @router.callback_query(F.data == ARC_COMPRESS)
-async def arc_compress_start(query: CallbackQuery, state: FSMContext):
+async def arc_compress_start(query: CallbackQuery, state: FSMContext, db_user=None):
+    limits = get_effective_limits(query.from_user.id, db_user)
     await state.set_state(ArchiveStates.waiting_for_compress_format)
     await query.message.edit_text("Choose the archive format to create:", reply_markup=archive_format_keyboard())
+    await state.update_data(archive_compress_limit=limits.archive_compress_limit)
     await query.answer()
 
 
@@ -79,40 +79,38 @@ async def arc_compress_start(query: CallbackQuery, state: FSMContext):
     ArchiveStates.waiting_for_compress_format,
     F.data.in_({ARC_FORMAT_ZIP, ARC_FORMAT_7Z}),
 )
-async def arc_compress_format_chosen(query: CallbackQuery, state: FSMContext):
+async def arc_compress_format_chosen(query: CallbackQuery, state: FSMContext, db_user=None):
     fmt = ArchiveFormat.ZIP if query.data == ARC_FORMAT_ZIP else ArchiveFormat.SEVEN_Z
+    limits = get_effective_limits(query.from_user.id, db_user)
     await state.update_data(archive_format=fmt.value)
     await state.set_state(ArchiveStates.waiting_for_files_compress)
+    limit_str = "unlimited" if limits.unlimited else f"up to {limits.archive_compress_limit}"
     await query.message.edit_text(
         f"Send the files to add to the {fmt.value.upper()} archive, one at a time.\n"
-        f"Up to {settings.MAX_FILES_PER_BATCH} files. Press 'Done' when finished.",
+        f"You may send {limit_str} files. Press 'Done' when finished.",
         reply_markup=archive_upload_done_keyboard(),
     )
     await query.answer()
 
 
 @router.message(ArchiveStates.waiting_for_files_compress, F.document)
-async def arc_compress_receive(message: Message, state: FSMContext):
-    owner = is_owner(message.from_user.id)
+async def arc_compress_receive(message: Message, state: FSMContext, db_user=None):
+    limits = get_effective_limits(message.from_user.id, db_user)
 
     current = await get_tracked_files(state)
 
-    # Unlimited number of files for owner
-    if not owner:
-        if len(current) >= settings.MAX_FILES_PER_BATCH:
-            await message.answer(
-                f"Maximum of {settings.MAX_FILES_PER_BATCH} files reached. Press 'Done'."
-            )
-            return
+    if not limits.unlimited and len(current) >= limits.archive_compress_limit:
+        await message.answer(
+            f"Maximum of {limits.archive_compress_limit} files reached. Press 'Done'."
+        )
+        return
 
     doc = message.document
 
-    # Unlimited file size for owner
-    if not owner:
-        if doc.file_size and doc.file_size > settings.MAX_FILE_SIZE:
-            limit_mb = settings.MAX_FILE_SIZE // (1024 * 1024)
-            await message.answer(f"File too large (max {limit_mb} MB).")
-            return
+    if not limits.unlimited and doc.file_size and doc.file_size > limits.file_size:
+        limit_mb = limits.file_size // (1024 * 1024)
+        await message.answer(f"File too large (max {limit_mb} MB).")
+        return
 
     suffix = (
         "." + (doc.file_name or "").rsplit(".", 1)[-1].lower()
@@ -137,13 +135,11 @@ async def arc_compress_receive(message: Message, state: FSMContext):
 
     count = len(await get_tracked_files(state))
 
-    if owner:
-        await message.answer(
-            f"Added file #{count}. Send more files or press 'Done'."
-        )
+    if limits.unlimited:
+        await message.answer(f"Added file #{count}. Send more files or press 'Done'.")
     else:
         await message.answer(
-            f"Added file {count}/{settings.MAX_FILES_PER_BATCH}. Send more or press 'Done'."
+            f"Added file {count}/{limits.archive_compress_limit}. Send more or press 'Done'."
         )
 
 
@@ -193,12 +189,14 @@ async def arc_extract_start(query: CallbackQuery, state: FSMContext):
 
 @router.message(ArchiveStates.waiting_for_file_extract, F.document)
 async def arc_extract_process(message: Message, state: FSMContext, user_repo=None, db_user=None):
+    limits = get_effective_limits(message.from_user.id, db_user)
+
     doc = message.document
     if doc is None:
         await message.answer("Please send an archive file as a document.")
         return
-    if doc.file_size and doc.file_size > settings.MAX_FILE_SIZE:
-        limit_mb = settings.MAX_FILE_SIZE // (1024 * 1024)
+    if not limits.unlimited and doc.file_size and doc.file_size > limits.file_size:
+        limit_mb = limits.file_size // (1024 * 1024)
         await message.answer(f"File too large (max {limit_mb} MB).")
         return
     if not validate_extension(doc.file_name or "", SUPPORTED_ARCHIVE_EXTS):
@@ -224,19 +222,24 @@ async def arc_extract_process(message: Message, state: FSMContext, user_repo=Non
     cleanup_paths = [path, dest_dir]
 
     try:
-        if len(extracted) > MAX_EXTRACTED_FILES_TO_RETURN:
-            # Too many files to send individually -- re-zip them into one
-            # convenience download instead of flooding the chat.
+        # Owner: NEVER re-zip -- always send every extracted file
+        # individually, no matter how many there are. Only non-owner users
+        # are subject to the "bundle into one zip above N files" convenience
+        # threshold, and even that threshold is per-user upgradeable via
+        # /upgrade <user_id> archive_extract <limit>.
+        if not limits.unlimited and len(extracted) > limits.archive_extract_return_limit:
             await message.answer(
-                f"Archive contains {len(extracted)} files (more than {MAX_EXTRACTED_FILES_TO_RETURN}); "
-                f"sending them bundled back into one ZIP."
+                f"Archive contains {len(extracted)} files (more than "
+                f"{limits.archive_extract_return_limit}); sending them bundled "
+                f"back into one ZIP."
             )
             rezip_path = await ArchiveCompressor().compress(extracted, ArchiveFormat.ZIP)
             cleanup_paths.append(rezip_path)
             await message.answer_document(FSInputFile(rezip_path, filename="extracted.zip"))
         else:
+            if limits.unlimited and len(extracted) > 20:
+                await message.answer(f"Sending all {len(extracted)} extracted files individually...")
             for f in extracted:
-                import os
                 await message.answer_document(FSInputFile(f, filename=os.path.basename(f)))
     finally:
         delete_paths(cleanup_paths)
