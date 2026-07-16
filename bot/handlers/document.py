@@ -7,8 +7,8 @@ from bot.states.document import DocumentStates
 from bot.keyboards.document import get_document_menu, DOC_CONVERT_TO_PDF
 from bot.keyboards.common import back_home_cancel
 from core.constants import CB_DOCUMENT, SUPPORTED_DOC_EXTS
-from core.config import settings
 from core.logger import logger
+from utils.limits import get_effective_limits
 
 from services.document.converter import DocumentConverter, DocumentProcessingError
 from utils.tempfiles import new_temp_path, track_temp_file, untrack_temp_files, delete_paths
@@ -52,8 +52,9 @@ async def doc_convert_process(message: Message, state: FSMContext, user_repo=Non
     if doc is None:
         await message.answer("Please send a document file.")
         return
-    if doc.file_size and doc.file_size > settings.MAX_FILE_SIZE:
-        limit_mb = settings.MAX_FILE_SIZE // (1024 * 1024)
+    limits = get_effective_limits(message.from_user.id, db_user)
+    if not limits.unlimited and doc.file_size and doc.file_size > limits.file_size:
+        limit_mb = limits.file_size // (1024 * 1024)
         await message.answer(f"File too large (max {limit_mb} MB).")
         return
     if not validate_extension(doc.file_name or "", SUPPORTED_DOC_EXTS):
@@ -68,7 +69,7 @@ async def doc_convert_process(message: Message, state: FSMContext, user_repo=Non
 
     await message.answer("Converting to PDF... this can take up to a minute, please wait.")
     try:
-        output_path = await DocumentConverter().convert_to_pdf(path)
+        output_path = await DocumentConverter().convert_to_pdf(path, timeout=limits.libreoffice_timeout)
     except DocumentProcessingError as e:
         await message.answer(f"⚠️ {e}")
         delete_paths([path])
