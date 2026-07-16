@@ -9,8 +9,6 @@ from core.logger import logger
 from utils.tempfiles import new_temp_path
 from services.archive._common import ArchiveProcessingError
 
-MAX_FILES = 50
-
 
 class ArchiveFormat(str, Enum):
     ZIP = "zip"
@@ -19,10 +17,16 @@ class ArchiveFormat(str, Enum):
 
 class ArchiveCompressor:
     async def compress(self, input_paths: List[str], fmt: ArchiveFormat = ArchiveFormat.ZIP) -> str:
+        """Combine `input_paths` into one archive. Count limits are enforced
+        by the caller (via utils.limits.get_effective_limits) BEFORE files
+        are ever collected here -- this service layer doesn't re-impose its
+        own cap, so it can't clash with a user's (or the owner's) effective
+        limit, and it stays reusable for internal call sites (e.g. Archive
+        Extract's "bundle into one zip" fallback) that need to compress more
+        files than a fresh upload batch would normally allow.
+        """
         if not input_paths:
             raise ArchiveProcessingError("No files provided.")
-        if len(input_paths) > MAX_FILES:
-            raise ArchiveProcessingError(f"Too many files (max {MAX_FILES}).")
         return await asyncio.to_thread(self._compress_sync, input_paths, fmt)
 
     @staticmethod
