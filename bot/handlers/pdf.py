@@ -82,16 +82,55 @@ _IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp", "image/bmp", "image/tif
 # runs with aiogram's MemoryStorage -- a single process already.
 _merge_batch_tasks: Dict[int, asyncio.Task] = {}
 
+# Task 2 fix: Telegram delivers every file in a media group as a separate
+# Message update, and aiogram's default polling dispatches each update as
+# its own concurrently-running asyncio.Task. That meant concurrent calls to
+# pdf_merge_receive() were doing a get_data() -> mutate -> update_data()
+# read-modify-write on the same FSM state entry (the tracked-files list)
+# with `await` points (the download) in between -- classic lost-update race.
+# The more files in the album, the more concurrent tasks, the more likely
+# two of them read the same "before" list and the second write clobbered
+# the first, silently dropping files. A per-chat lock serializes the whole
+# receive-and-track critical section so every file is registered before the
+# next one is processed, regardless of how many arrive at once.
+_merge_locks: Dict[int, asyncio.Lock] = {}
+
+
+def get_merge_lock(chat_id: int) -> asyncio.Lock:
+    """The single per-chat lock that serializes every piece of code that
+    touches a chat's merge queue: receiving a file, pressing Done, actually
+    performing the merge, and resetting/cancelling the flow (Cancel/Back/
+    Home/a fresh /start -- see base.py's `_reset_to_main_menu`). Giving all
+    of those one shared lock -- rather than just guarding the upload path --
+    is what makes "Done pressed while uploads are still arriving" and
+    "Cancel pressed mid-upload" safe: whichever one grabs the lock first
+    runs to completion before the other can see or mutate the queue state,
+    so a straggling upload can never be silently dropped, double counted,
+    or written into a queue that has already moved on / been reset.
+    """
+    lock = _merge_locks.get(chat_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _merge_locks[chat_id] = lock
+    return lock
+
 
 def cancel_pending_merge_batch(chat_id: int) -> None:
-    """Cancel any pending merge-batch finalize task for `chat_id`. Called
-    whenever the merge flow ends outside of its own Done handler (Cancel,
-    Back, Home, a fresh /start) so a stale task never edits a message that
-    no longer belongs to an active merge queue.
+    """Cancel any pending merge-batch finalize task for `chat_id`, and drop
+    that chat's merge lock from the registry. Called whenever the merge
+    flow leaves the "waiting for files" stage -- Done, Cancel, Back, Home,
+    or a fresh /start -- so a stale task never edits a message that no
+    longer belongs to an active merge queue, and the lock dict never grows
+    without bound. This is always called by a caller that is itself
+    holding (a local reference to) that very lock, so dropping it from the
+    dict here is safe: any task still waiting on it holds its own
+    reference and is unaffected, and the next merge flow to touch this
+    chat simply gets a fresh, uncontended lock.
     """
     task = _merge_batch_tasks.pop(chat_id, None)
     if task and not task.done():
         task.cancel()
+    _merge_locks.pop(chat_id, None)
 
 
 # --------------------------------------------------------------------------
@@ -251,6 +290,78 @@ async def _fail(message: Message, state: FSMContext, error: Exception, cleanup_p
 # Merge (multi-file upload + Done button)
 # --------------------------------------------------------------------------
 
+_QUEUE_DIVIDER = "━━━━━━━━━━━━━━━━━━━━━━"
+_QUEUE_LATEST_FILES_SHOWN = 5
+
+
+def _render_processing_text(count: int) -> str:
+    plural = "PDFs" if count != 1 else "PDF"
+    return (
+        f"{_QUEUE_DIVIDER}\n"
+        "📄 MERGE QUEUE\n\n"
+        "⏳ Processing uploads...\n\n"
+        f"Detected: {count} {plural}\n"
+        f"{_QUEUE_DIVIDER}"
+    )
+
+
+def _render_queue_updated_text(count: int, file_names: List[str]) -> str:
+    lines = [
+        _QUEUE_DIVIDER,
+        "📄 MERGE QUEUE",
+        "",
+        "✅ Queue Updated",
+        "",
+        "📦 Total PDFs:",
+        str(count),
+        "",
+    ]
+    if count > _QUEUE_LATEST_FILES_SHOWN:
+        lines.append("Latest files:")
+        lines.append("")
+        for name in file_names[-_QUEUE_LATEST_FILES_SHOWN:]:
+            lines.append(f"• {name}")
+        remaining = count - _QUEUE_LATEST_FILES_SHOWN
+        lines.append("")
+        lines.append(f"...and {remaining} more")
+        lines.append("")
+        lines.append("Press ✅ Done")
+    else:
+        lines.append("Ready to merge.")
+        lines.append("")
+        lines.append("Press ✅ Done when finished.")
+    lines.append(_QUEUE_DIVIDER)
+    return "\n".join(lines)
+
+
+async def _start_new_queue_message(bot, state: FSMContext, chat_id: int, count: int) -> None:
+    """Delete the previous Merge Queue message (if any -- this also covers
+    the initial "send your PDFs" prompt, which the first uploaded batch
+    replaces) and send a fresh one. Telegram already displays the uploaded
+    files themselves; this fresh message lands right after them, so the
+    queue status always sits below the newest uploads instead of above them
+    (Task 1), and no stale queue message is ever left behind.
+    """
+    data = await state.get_data()
+    old_message_id = data.get("merge_status_message_id")
+    if old_message_id is not None:
+        try:
+            await bot.delete_message(chat_id, old_message_id)
+        except Exception as e:
+            logger.debug(f"Merge: could not delete previous queue message: {e}")
+
+    sent = await bot.send_message(
+        chat_id,
+        _render_processing_text(count),
+        reply_markup=merge_queue_keyboard(),
+    )
+    await state.update_data(
+        merge_status_chat_id=chat_id,
+        merge_status_message_id=sent.message_id,
+        merge_last_status_edit_ts=time.monotonic(),
+    )
+
+
 async def _edit_merge_status(
     bot,
     state: FSMContext,
@@ -291,27 +402,36 @@ async def _edit_merge_status(
 async def _finalize_merge_batch(bot, state: FSMContext, chat_id: int) -> None:
     """Runs MERGE_BATCH_FINALIZE_DELAY_SECONDS after the most recent file in
     a burst; if no newer file has rescheduled it in the meantime, does the
-    "✅ Added to Queue" edit for the whole batch at once.
+    "✅ Queue Updated" edit for the whole batch at once.
     """
     try:
         await asyncio.sleep(MERGE_BATCH_FINALIZE_DELAY_SECONDS)
     except asyncio.CancelledError:
         return
 
-    if _merge_batch_tasks.get(chat_id) is not asyncio.current_task():
-        return  # a newer file superseded this task while we were waiting
-    _merge_batch_tasks.pop(chat_id, None)
+    # Acquire the same lock pdf_merge_receive/pdf_merge_done/reset use, so
+    # this edit can never land after (and clobber) whatever Done/Cancel/
+    # Back/Home already put on screen once the user has moved on -- and so
+    # cancel_pending_merge_batch() can't drop this task mid-edit either,
+    # since the canceller has to wait for us to release the lock first.
+    lock = get_merge_lock(chat_id)
+    async with lock:
+        if _merge_batch_tasks.get(chat_id) is not asyncio.current_task():
+            return  # a newer file superseded this task while we were waiting
+        _merge_batch_tasks.pop(chat_id, None)
 
-    if await state.get_state() != PDFStates.waiting_for_files_merge.state:
-        return  # flow was cancelled/finished/navigated away in the meantime
+        if await state.get_state() != PDFStates.waiting_for_files_merge.state:
+            return  # flow was cancelled/finished/navigated away in the meantime
 
-    count = len(await get_tracked_files(state))
-    await _edit_merge_status(
-        bot, state,
-        f"✅ Added to Queue\n\n📄 Files Added: {count}",
-        keyboard=merge_queue_keyboard(),
-        force=True,
-    )
+        data = await state.get_data()
+        file_names: List[str] = list(data.get("merge_file_names", []))
+        count = len(await get_tracked_files(state))
+        await _edit_merge_status(
+            bot, state,
+            _render_queue_updated_text(count, file_names),
+            keyboard=merge_queue_keyboard(),
+            force=True,
+        )
 
 
 # --------------------------------------------------------------------------
@@ -339,6 +459,7 @@ async def pdf_merge_start(query: CallbackQuery, state: FSMContext):
 async def pdf_merge_receive(message: Message, state: FSMContext, user_repo=None, bot_config_repo=None, db_user=None):
     doc = message.document
     user_id = message.from_user.id
+    chat_id = message.chat.id
 
     # Task 4: only PDF documents are accepted into the merge queue.
     if not validate_extension(doc.file_name or "", SUPPORTED_PDF_EXTS):
@@ -346,71 +467,108 @@ async def pdf_merge_receive(message: Message, state: FSMContext, user_repo=None,
         logger.info(f"Merge: rejected non-PDF document '{doc.file_name}' from user {user_id}")
         return
 
-    # Task 3: captions are never read here -- only the attached document.
     limits = get_effective_limits(user_id, db_user)
-    current = await get_tracked_files(state)
-    if not limits.unlimited and len(current) >= limits.pdf_queue_limit:
-        await message.answer(
-            f"You've reached your merge queue limit of {limits.pdf_queue_limit} PDFs. "
-            f"Press Done to merge, or Cancel."
+
+    # Task 2 fix: everything that reads-then-writes the tracked-files list
+    # (the queue-limit check, the download, and track_temp_file itself) runs
+    # under a per-chat lock. Telegram fires one Message update per file in a
+    # media group and aiogram handles them as concurrent tasks, so without
+    # this lock two files arriving close together can race on the FSM
+    # state's get_data()/update_data() pair and one silently overwrites the
+    # other's registration -- worse the more files land at once, which is
+    # exactly the ">~7 PDFs -> only 1 detected" symptom. Locking the whole
+    # section guarantees every file is fully registered before the next one
+    # is even validated, so nothing is ever dropped, no matter the album size.
+    lock = get_merge_lock(chat_id)
+    async with lock:
+        # Task 3: captions are never read here -- only the attached document.
+        data = await state.get_data()
+        current = await get_tracked_files(state)
+        if not limits.unlimited and len(current) >= limits.pdf_queue_limit:
+            await message.answer(
+                f"You've reached your merge queue limit of {limits.pdf_queue_limit} PDFs. "
+                f"Press Done to merge, or Cancel."
+            )
+            return
+
+        # Guard against Telegram redelivering an update (rare, but possible
+        # on flaky connections/polling hiccups): dedupe by Telegram's own
+        # file_unique_id, which identifies the actual file content, not our
+        # locally-generated temp path -- a resend of the same update would
+        # otherwise download and queue the same PDF a second time.
+        seen_ids: List[str] = list(data.get("merge_seen_file_ids", []))
+        if doc.file_unique_id and doc.file_unique_id in seen_ids:
+            logger.info(f"Merge: duplicate upload ignored for user {user_id} (file_unique_id={doc.file_unique_id})")
+            return
+
+        userbot_enabled = bool(bot_config_repo) and await bot_config_repo.is_userbot_enabled()
+        # The owner is unlimited on file size everywhere, including Merge. For
+        # everyone else the ceiling still depends on which transport will be
+        # used (the userbot MTProto path supports much larger files than the
+        # plain Bot API) -- that's a technical capability, not a limit we
+        # impose, so it stays independent of the centralized limits.file_size.
+        size_ceiling = None if limits.unlimited else (
+            settings.MAX_FILE_SIZE_USERBOT if userbot_enabled else settings.MAX_FILE_SIZE
         )
-        return
+        if size_ceiling is not None and doc.file_size and doc.file_size > size_ceiling:
+            await message.answer(f"File too large (max {size_ceiling // (1024 * 1024)} MB).")
+            return
 
-    userbot_enabled = bool(bot_config_repo) and await bot_config_repo.is_userbot_enabled()
-    # The owner is unlimited on file size everywhere, including Merge. For
-    # everyone else the ceiling still depends on which transport will be
-    # used (the userbot MTProto path supports much larger files than the
-    # plain Bot API) -- that's a technical capability, not a limit we
-    # impose, so it stays independent of the centralized limits.file_size.
-    size_ceiling = None if limits.unlimited else (
-        settings.MAX_FILE_SIZE_USERBOT if userbot_enabled else settings.MAX_FILE_SIZE
-    )
-    if size_ceiling is not None and doc.file_size and doc.file_size > size_ceiling:
-        await message.answer(f"File too large (max {size_ceiling // (1024 * 1024)} MB).")
-        return
+        temp_path = new_temp_path(suffix=".pdf")
+        await track_temp_file(state, temp_path)
 
-    position = len(current) + 1
-    await _edit_merge_status(
-        message.bot, state,
-        f"⬇ Downloading...\nProcessing {position}",
-        keyboard=merge_queue_keyboard(),
-    )
+        transport = await get_transport(doc.file_size or 0, userbot_enabled)
+        try:
+            await transport.download(message, temp_path)
+        except Exception as e:
+            logger.error(f"Merge: download failed for user {user_id}: {e}")
+            await untrack_temp_files(state, [temp_path])
+            delete_paths([temp_path])
+            await message.answer("Failed to download that file from Telegram. Please try again.")
+            return
 
-    temp_path = new_temp_path(suffix=".pdf")
-    await track_temp_file(state, temp_path)
+        error = validate_upload(
+            temp_path, doc.file_name or "file.pdf",
+            allowed_extensions=SUPPORTED_PDF_EXTS, allowed_mime_types=_PDF_MIME,
+            max_size=size_ceiling,
+        )
+        if error:
+            await untrack_temp_files(state, [temp_path])
+            delete_paths([temp_path])
+            await message.answer(error)
+            logger.info(f"Merge: rejected invalid PDF from user {user_id}: {error}")
+            return
 
-    transport = await get_transport(doc.file_size or 0, userbot_enabled)
-    try:
-        await transport.download(message, temp_path)
-    except Exception as e:
-        logger.error(f"Merge: download failed for user {user_id}: {e}")
-        await untrack_temp_files(state, [temp_path])
-        delete_paths([temp_path])
-        await message.answer("Failed to download that file from Telegram. Please try again.")
-        return
+        file_names: List[str] = list(data.get("merge_file_names", []))
+        file_names.append(doc.file_name or "file.pdf")
+        if doc.file_unique_id:
+            seen_ids.append(doc.file_unique_id)
+        await state.update_data(merge_file_names=file_names, merge_seen_file_ids=seen_ids)
 
-    error = validate_upload(
-        temp_path, doc.file_name or "file.pdf",
-        allowed_extensions=SUPPORTED_PDF_EXTS, allowed_mime_types=_PDF_MIME,
-        max_size=size_ceiling,
-    )
-    if error:
-        await untrack_temp_files(state, [temp_path])
-        delete_paths([temp_path])
-        await message.answer(error)
-        logger.info(f"Merge: rejected invalid PDF from user {user_id}: {error}")
-        return
+        total = len(await get_tracked_files(state))
+        logger.info(f"Merge: file {total} queued for user {user_id}")
 
-    total = len(await get_tracked_files(state))
-    logger.info(f"Merge: file {total} queued for user {user_id}")
+        # Task 1: collapse a burst of files (one message with several PDFs,
+        # or a media group) into a single queue message that always sits
+        # below the newest uploads. If no batch is currently in flight for
+        # this chat, this is the start of a fresh batch -- delete whatever
+        # queue message (or the initial prompt) is currently showing and
+        # post a new one below the files just uploaded. If a batch is
+        # already in flight, just update that same message in place.
+        existing_task = _merge_batch_tasks.get(chat_id)
+        if existing_task is None or existing_task.done():
+            await _start_new_queue_message(message.bot, state, chat_id, total)
+        else:
+            await _edit_merge_status(
+                message.bot, state,
+                _render_processing_text(total),
+                keyboard=merge_queue_keyboard(),
+            )
 
-    # Collapse a burst of files (single message with several PDFs, or a
-    # media group) into one "Added to Queue" edit instead of one per file.
-    chat_id = message.chat.id
-    previous_task = _merge_batch_tasks.get(chat_id)
-    if previous_task and not previous_task.done():
-        previous_task.cancel()
-    _merge_batch_tasks[chat_id] = asyncio.create_task(_finalize_merge_batch(message.bot, state, chat_id))
+        previous_task = _merge_batch_tasks.get(chat_id)
+        if previous_task and not previous_task.done():
+            previous_task.cancel()
+        _merge_batch_tasks[chat_id] = asyncio.create_task(_finalize_merge_batch(message.bot, state, chat_id))
 
 
 @router.message(PDFStates.waiting_for_files_merge)
@@ -424,68 +582,86 @@ async def pdf_merge_reject_wrong_input(message: Message):
 
 @router.callback_query(PDFStates.waiting_for_files_merge, F.data == PDF_DONE)
 async def pdf_merge_done(query: CallbackQuery, state: FSMContext):
-    cancel_pending_merge_batch(query.message.chat.id)
-    files = await get_tracked_files(state)
+    chat_id = query.message.chat.id
     await query.answer()
-    if len(files) < 2:
-        await query.message.answer("Need at least 2 PDF files to merge. Send more files, or press Cancel.")
-        return
+    # Shares the lock with pdf_merge_receive: if a file is still mid-download
+    # when Done is pressed, this waits for it to finish registering (and
+    # updating the queue message) before we read the count and move on --
+    # so that straggling upload is counted in, never silently dropped, and
+    # its own queue-message edit can never land after ours and clobber the
+    # "send a filename" prompt.
+    async with get_merge_lock(chat_id):
+        cancel_pending_merge_batch(chat_id)
+        files = await get_tracked_files(state)
+        if len(files) < 2:
+            await query.message.answer("Need at least 2 PDF files to merge. Send more files, or press Cancel.")
+            return
 
-    await state.set_state(PDFStates.waiting_for_merge_filename)
-    await _edit_merge_status(
-        query.bot, state,
-        f"📄 Files Added: {len(files)}\n\n📝 Send the output filename (e.g. physics_notes) -- I'll add .pdf for you.",
-        keyboard=back_home_cancel(),
-        force=True,
-    )
-    logger.info(f"Merge: {len(files)} files ready, awaiting output filename from user {query.from_user.id}")
+        await state.set_state(PDFStates.waiting_for_merge_filename)
+        await _edit_merge_status(
+            query.bot, state,
+            f"📄 Files Added: {len(files)}\n\n📝 Send the output filename (e.g. physics_notes) -- I'll add .pdf for you.",
+            keyboard=back_home_cancel(),
+            force=True,
+        )
+        logger.info(f"Merge: {len(files)} files ready, awaiting output filename from user {query.from_user.id}")
 
 
 @router.message(PDFStates.waiting_for_merge_filename, F.text)
 async def pdf_merge_filename_receive(message: Message, state: FSMContext, user_repo=None, db_user=None, bot_config_repo=None):
-    cancel_pending_merge_batch(message.chat.id)
-    files = await get_tracked_files(state)
-    if len(files) < 2:
-        await message.answer("Session expired, please start over.")
-        await state.clear()
-        return
+    chat_id = message.chat.id
+    # Held for the whole operation, including the merge, send, and cleanup
+    # below: this is what makes a pathologically late straggling upload (one
+    # that was still downloading when Done was pressed and is somehow still
+    # not done by the time the user has already typed a filename) safe --
+    # rather than being silently dropped OR leaking an orphaned temp file,
+    # it simply has to wait for this whole merge to finish, at which point
+    # state.clear() means it discards itself gracefully instead of writing
+    # into state that no longer describes an active merge.
+    async with get_merge_lock(chat_id):
+        cancel_pending_merge_batch(chat_id)
+        files = await get_tracked_files(state)
+        if len(files) < 2:
+            await message.answer("Session expired, please start over.")
+            await state.clear()
+            return
 
-    # Task 8: sanitize the user-supplied name and always end in .pdf.
-    safe = sanitize_filename(message.text.strip())
-    if safe.lower().endswith(".pdf"):
-        safe = safe[:-4]
-    if not safe:
-        safe = "merged"
-    filename = f"{safe}.pdf"
+        # Task 8: sanitize the user-supplied name and always end in .pdf.
+        safe = sanitize_filename(message.text.strip())
+        if safe.lower().endswith(".pdf"):
+            safe = safe[:-4]
+        if not safe:
+            safe = "merged"
+        filename = f"{safe}.pdf"
 
-    await message.answer("Merging... please wait.")
-    logger.info(f"Merge: merging {len(files)} files for user {message.from_user.id} -> {filename}")
-    try:
-        output_path = await PDFMerger().merge(files)
-    except Exception as e:
-        logger.error(f"Merge: merge failed for user {message.from_user.id}: {e}")
-        await _fail(message, state, e, files)
-        return
+        await message.answer("Merging... please wait.")
+        logger.info(f"Merge: merging {len(files)} files for user {message.from_user.id} -> {filename}")
+        try:
+            output_path = await PDFMerger().merge(files)
+        except Exception as e:
+            logger.error(f"Merge: merge failed for user {message.from_user.id}: {e}")
+            await _fail(message, state, e, files)
+            return
 
-    await track_temp_file(state, output_path)
+        await track_temp_file(state, output_path)
 
-    userbot_enabled = bool(bot_config_repo) and await bot_config_repo.is_userbot_enabled()
-    transport = await get_transport(os.path.getsize(output_path), userbot_enabled)
+        userbot_enabled = bool(bot_config_repo) and await bot_config_repo.is_userbot_enabled()
+        transport = await get_transport(os.path.getsize(output_path), userbot_enabled)
 
-    cleanup_paths = files + [output_path]
-    try:
-        await transport.send_document(message, output_path, filename, caption="Here's your merged PDF.")
-    except Exception:
-        logger.exception(f"Merge: failed to send merged output to user {message.from_user.id}")
-        raise
-    finally:
-        delete_paths(cleanup_paths)
-        await untrack_temp_files(state, cleanup_paths)
-        await state.clear()
-        logger.info(f"Merge: cleanup done for user {message.from_user.id} ({len(cleanup_paths)} temp paths)")
+        cleanup_paths = files + [output_path]
+        try:
+            await transport.send_document(message, output_path, filename, caption="Here's your merged PDF.")
+        except Exception:
+            logger.exception(f"Merge: failed to send merged output to user {message.from_user.id}")
+            raise
+        finally:
+            delete_paths(cleanup_paths)
+            await untrack_temp_files(state, cleanup_paths)
+            await state.clear()
+            logger.info(f"Merge: cleanup done for user {message.from_user.id} ({len(cleanup_paths)} temp paths)")
 
-    await _track_usage(user_repo, db_user)
-    logger.info(f"Merge: sent {filename} to user {message.from_user.id}")
+        await _track_usage(user_repo, db_user)
+        logger.info(f"Merge: sent {filename} to user {message.from_user.id}")
 
 
 @router.message(PDFStates.waiting_for_merge_filename)
