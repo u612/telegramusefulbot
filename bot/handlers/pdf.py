@@ -356,7 +356,6 @@ _DISPLAY_NAME_MAX = 42  # visible chars before "...pdf", per the filename-shorte
 MERGE_CB_CANCEL = "pdfmerge:cancel"                # opens the confirmation screen
 MERGE_CB_CANCEL_YES = "pdfmerge:cancel_yes"
 MERGE_CB_CANCEL_NO = "pdfmerge:cancel_no"
-MERGE_CB_HOME = "pdfmerge:home"
 MERGE_CB_PROCEED_CURRENT_ORDER = "pdfmerge:proceed_current_order"
 MERGE_CB_CONFIRM = "pdfmerge:confirm"
 MERGE_CB_REARRANGE_AGAIN = "pdfmerge:rearrange_again"
@@ -385,9 +384,8 @@ def _merge_upload_keyboard():
 def _merge_arrange_keyboard():
     b = InlineKeyboardBuilder()
     b.button(text="✅ Proceed with This Order", callback_data=MERGE_CB_PROCEED_CURRENT_ORDER)
-    b.button(text="🏠 Home", callback_data=MERGE_CB_HOME)
     b.button(text="❌ Cancel", callback_data=MERGE_CB_CANCEL)
-    b.adjust(1, 2)
+    b.adjust(1, 1)
     return b.as_markup()
 
 
@@ -396,17 +394,15 @@ def _merge_preview_keyboard():
     b.button(text="✅ Confirm", callback_data=MERGE_CB_CONFIRM)
     b.button(text="🔄 Rearrange Again", callback_data=MERGE_CB_REARRANGE_AGAIN)
     b.button(text="➕ Add More", callback_data=MERGE_CB_ADD_MORE)
-    b.button(text="🏠 Home", callback_data=MERGE_CB_HOME)
     b.button(text="❌ Cancel", callback_data=MERGE_CB_CANCEL)
-    b.adjust(1, 1, 1, 2)
+    b.adjust(1, 1, 1, 1)
     return b.as_markup()
 
 
 def _merge_filename_keyboard():
     b = InlineKeyboardBuilder()
-    b.button(text="🏠 Home", callback_data=MERGE_CB_HOME)
     b.button(text="❌ Cancel", callback_data=MERGE_CB_CANCEL)
-    b.adjust(2)
+    b.adjust(1)
     return b.as_markup()
 
 
@@ -1223,22 +1219,6 @@ async def pdf_merge_cancel_no(query: CallbackQuery, state: FSMContext):
             _render_queue_updated_text(len(sizes), sizes, add_more=add_more),
             keyboard=_merge_upload_keyboard(), force=True,
         )
-
-
-@router.callback_query(StateFilter(*_MERGE_STATES), F.data == MERGE_CB_HOME)
-async def pdf_merge_home(query: CallbackQuery, state: FSMContext):
-    """Home returns to the PDF Toolkit main menu and also clears the
-    Merge session (distinct from Cancel, which asks for confirmation
-    first and shows a dedicated cancelled message).
-    """
-    chat_id = query.message.chat.id
-    await query.answer()
-    await _merge_full_cleanup(state, chat_id)
-    await query.message.edit_text(
-        "📄 PDF Toolkit -- choose an operation:",
-        reply_markup=get_pdf_menu(),
-    )
-    logger.info(f"Merge: returned to PDF Toolkit menu by user {query.from_user.id}")
 
 
 # --------------------------------------------------------------------------
