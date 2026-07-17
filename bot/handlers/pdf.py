@@ -183,9 +183,9 @@ def cancel_pending_merge_batch(chat_id: int) -> None:
 
 @router.callback_query(F.data == CB_PDF)
 async def pdf_menu_open(query: CallbackQuery, state: FSMContext):
-    """Opens the PDF submenu from the main menu's "ðŸ“„ PDF" button."""
+    """Opens the PDF submenu from the main menu's "📄 PDF" button."""
     await query.message.edit_text(
-        "ðŸ“„ PDF Toolkit -- choose an operation:",
+        "📄 PDF Toolkit -- choose an operation:",
         reply_markup=get_pdf_menu(),
     )
     await query.answer()
@@ -321,7 +321,7 @@ async def _fail(message: Message, state: FSMContext, error: Exception, cleanup_p
     leave the flow (rather than getting stuck in a dead state).
     """
     if isinstance(error, PDFProcessingError):
-        await message.answer(f"âš ï¸ {error}")
+        await message.answer(f"⚠️ {error}")
     else:
         logger.exception(f"Unexpected PDF processing error: {error}")
         await message.answer("Something went wrong processing that file. Please try again.")
@@ -333,7 +333,7 @@ async def _fail(message: Message, state: FSMContext, error: Exception, cleanup_p
 # Merge queue UI
 # --------------------------------------------------------------------------
 
-_QUEUE_DIVIDER = "â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”"
+_QUEUE_DIVIDER = "━━━━━━━━━━━━━━━━━━━━━━"
 _DISPLAY_NAME_MAX = 42  # visible chars before "...pdf", per the filename-shortening spec
 
 # NOTE: This flow needs two additional FSM states beyond what already
@@ -376,44 +376,44 @@ _MERGE_STATES = (
 
 def _merge_upload_keyboard():
     b = InlineKeyboardBuilder()
-    b.button(text="âœ… Done", callback_data=PDF_DONE)
-    b.button(text="âŒ Cancel", callback_data=MERGE_CB_CANCEL)
+    b.button(text="✅ Done", callback_data=PDF_DONE)
+    b.button(text="❌ Cancel", callback_data=MERGE_CB_CANCEL)
     b.adjust(2)
     return b.as_markup()
 
 
 def _merge_arrange_keyboard():
     b = InlineKeyboardBuilder()
-    b.button(text="âœ… Proceed with This Order", callback_data=MERGE_CB_PROCEED_CURRENT_ORDER)
-    b.button(text="ðŸ  Home", callback_data=MERGE_CB_HOME)
-    b.button(text="âŒ Cancel", callback_data=MERGE_CB_CANCEL)
+    b.button(text="✅ Proceed with This Order", callback_data=MERGE_CB_PROCEED_CURRENT_ORDER)
+    b.button(text="🏠 Home", callback_data=MERGE_CB_HOME)
+    b.button(text="❌ Cancel", callback_data=MERGE_CB_CANCEL)
     b.adjust(1, 2)
     return b.as_markup()
 
 
 def _merge_preview_keyboard():
     b = InlineKeyboardBuilder()
-    b.button(text="âœ… Confirm", callback_data=MERGE_CB_CONFIRM)
-    b.button(text="ðŸ”„ Rearrange Again", callback_data=MERGE_CB_REARRANGE_AGAIN)
-    b.button(text="âž• Add More", callback_data=MERGE_CB_ADD_MORE)
-    b.button(text="ðŸ  Home", callback_data=MERGE_CB_HOME)
-    b.button(text="âŒ Cancel", callback_data=MERGE_CB_CANCEL)
+    b.button(text="✅ Confirm", callback_data=MERGE_CB_CONFIRM)
+    b.button(text="🔄 Rearrange Again", callback_data=MERGE_CB_REARRANGE_AGAIN)
+    b.button(text="➕ Add More", callback_data=MERGE_CB_ADD_MORE)
+    b.button(text="🏠 Home", callback_data=MERGE_CB_HOME)
+    b.button(text="❌ Cancel", callback_data=MERGE_CB_CANCEL)
     b.adjust(1, 1, 1, 2)
     return b.as_markup()
 
 
 def _merge_filename_keyboard():
     b = InlineKeyboardBuilder()
-    b.button(text="ðŸ  Home", callback_data=MERGE_CB_HOME)
-    b.button(text="âŒ Cancel", callback_data=MERGE_CB_CANCEL)
+    b.button(text="🏠 Home", callback_data=MERGE_CB_HOME)
+    b.button(text="❌ Cancel", callback_data=MERGE_CB_CANCEL)
     b.adjust(2)
     return b.as_markup()
 
 
 def _merge_cancel_confirm_keyboard():
     b = InlineKeyboardBuilder()
-    b.button(text="âœ… Yes, Cancel", callback_data=MERGE_CB_CANCEL_YES)
-    b.button(text="âŽ No, Continue", callback_data=MERGE_CB_CANCEL_NO)
+    b.button(text="✅ Yes, Cancel", callback_data=MERGE_CB_CANCEL_YES)
+    b.button(text="❎ No, Continue", callback_data=MERGE_CB_CANCEL_NO)
     b.adjust(2)
     return b.as_markup()
 
@@ -451,8 +451,8 @@ def _render_receiving_text() -> str:
     """
     return (
         f"{_QUEUE_DIVIDER}\n"
-        "ðŸ“„ Merge PDF\n\n"
-        "â³ Receiving your PDFs...\n\n"
+        "📄 Merge PDF\n\n"
+        "⏳ Receiving your PDFs...\n\n"
         "Please wait while all files are detected.\n"
         f"{_QUEUE_DIVIDER}"
     )
@@ -461,10 +461,10 @@ def _render_receiving_text() -> str:
 def _render_queue_updated_text(count: int, sizes: List[Optional[int]], failed: Optional[List[str]] = None, add_more: bool = False) -> str:
     lines = [
         _QUEUE_DIVIDER,
-        "ðŸ“„ Add More PDFs" if add_more else "ðŸ“„ Merge Queue",
+        "📄 Add More PDFs" if add_more else "📄 Merge Queue",
         "",
-        f"ðŸ“ Files: {count}",
-        f"ðŸ’¾ Total Size: {_format_total_size(sizes)}",
+        f"📁 Files: {count}",
+        f"💾 Total Size: {_format_total_size(sizes)}",
         "",
     ]
     if count > 0:
@@ -479,19 +479,19 @@ def _render_queue_updated_text(count: int, sizes: List[Optional[int]], failed: O
     if failed:
         shown = ", ".join(failed[:5])
         more = "" if len(failed) <= 5 else f", and {len(failed) - 5} more"
-        text += f"\n\nâš ï¸ Skipped {len(failed)} file(s) that failed to download or weren't valid PDFs: {shown}{more}"
+        text += f"\n\n⚠️ Skipped {len(failed)} file(s) that failed to download or weren't valid PDFs: {shown}{more}"
     return text
 
 
 def _render_arrange_text(names: List[str], sizes: List[Optional[int]], order: List[int]) -> str:
-    lines = [_QUEUE_DIVIDER, "ðŸ“„ Arrange PDF Order", "", "Current Order", ""]
+    lines = [_QUEUE_DIVIDER, "📄 Arrange PDF Order", "", "Current Order", ""]
     for pos, idx in enumerate(order, start=1):
         lines.append(f"{pos}. {_display_name(names[idx])} ({_format_size(sizes[idx])})")
     lines += [
         "",
         _QUEUE_DIVIDER,
         "",
-        "ðŸ“ Send the new order using numbers.",
+        "📝 Send the new order using numbers.",
         "Example:",
         "3,1,2",
     ]
@@ -499,7 +499,7 @@ def _render_arrange_text(names: List[str], sizes: List[Optional[int]], order: Li
 
 
 def _render_preview_text(names: List[str], sizes: List[Optional[int]], order: List[int]) -> str:
-    lines = [_QUEUE_DIVIDER, "âœ… New Merge Order", ""]
+    lines = [_QUEUE_DIVIDER, "✅ New Merge Order", ""]
     for pos, idx in enumerate(order, start=1):
         lines.append(f"{pos}. {_display_name(names[idx])} ({_format_size(sizes[idx])})")
     lines += ["", _QUEUE_DIVIDER, "", "Is this correct?"]
@@ -729,11 +729,11 @@ async def pdf_merge_start(query: CallbackQuery, state: FSMContext):
     await state.set_state(PDFStates.waiting_for_files_merge)
     await query.message.edit_text(
         f"{_QUEUE_DIVIDER}\n"
-        "ðŸ“„ Merge PDF\n\n"
+        "📄 Merge PDF\n\n"
         "Send your PDF files.\n\n"
-        "ðŸ’¡ Tip\n"
-        "â€¢ Upload up to 9 PDFs at once.\n"
-        "â€¢ If you have more, upload them in multiple batches.\n\n"
+        "💡 Tip\n"
+        "• Upload up to 9 PDFs at once.\n"
+        "• If you have more, upload them in multiple batches.\n\n"
         f"{_QUEUE_DIVIDER}\n\n"
         "Queue: 0 PDFs",
         reply_markup=_merge_upload_keyboard(),
@@ -760,7 +760,7 @@ async def pdf_merge_receive(message: Message, state: FSMContext, user_repo=None,
     chat_id = message.chat.id
 
     if not validate_extension(doc.file_name or "", SUPPORTED_PDF_EXTS):
-        await message.answer("âŒ Please send PDF files only.")
+        await message.answer("❌ Please send PDF files only.")
         logger.info(f"Merge: rejected non-PDF document '{doc.file_name}' from user {user_id}")
         return
 
@@ -831,7 +831,7 @@ async def pdf_merge_reject_wrong_input(message: Message):
     voice, audio, plain text, GIFs, stickers, etc.) -- reply politely
     instead of ever crashing or silently ignoring it.
     """
-    await message.answer("âŒ Please send PDF files only.")
+    await message.answer("❌ Please send PDF files only.")
 
 
 async def _enter_arrange_screen(bot, state: FSMContext, preserve_order: bool) -> None:
@@ -902,7 +902,7 @@ async def pdf_merge_done(query: CallbackQuery, state: FSMContext, bot_config_rep
         if len(files) < 2:
             msg = "Need at least 2 PDF files to merge. Send more files, or press Cancel."
             if failed:
-                msg += f"\n\nâš ï¸ {len(failed)} file(s) failed to process and were skipped."
+                msg += f"\n\n⚠️ {len(failed)} file(s) failed to process and were skipped."
             await query.message.answer(msg)
             return
 
@@ -931,7 +931,7 @@ async def pdf_merge_arrange_receive(message: Message, state: FSMContext):
             await message.delete()
         except Exception as e:
             logger.debug(f"Merge: could not delete user's invalid order message: {e}")
-        await _send_temp_validation_error(message.bot, message.chat.id, f"âš ï¸ {error}")
+        await _send_temp_validation_error(message.bot, message.chat.id, f"⚠️ {error}")
         return
 
     # `new_positions` are 0-based positions *within the currently displayed
@@ -1011,7 +1011,7 @@ async def pdf_merge_preview_confirm(query: CallbackQuery, state: FSMContext):
     chat_id = query.message.chat.id
     files = await get_tracked_files(state)
     await state.set_state(PDFStates.waiting_for_merge_filename)
-    text = f"ðŸ“„ Files Added: {len(files)}\n\nðŸ“ Send the output filename (e.g. physics_notes) -- I'll add .pdf for you."
+    text = f"📄 Files Added: {len(files)}\n\n📝 Send the output filename (e.g. physics_notes) -- I'll add .pdf for you."
     await _start_new_queue_message(
         query.bot, state, chat_id, text,
         keyboard=_merge_filename_keyboard(),
@@ -1068,7 +1068,7 @@ async def pdf_merge_filename_receive(message: Message, state: FSMContext, user_r
 
         await _edit_merge_status(
             message.bot, state,
-            f"{_QUEUE_DIVIDER}\nðŸ“„ Merging PDFs...\n\nâ³ Please wait...\n{_QUEUE_DIVIDER}",
+            f"{_QUEUE_DIVIDER}\n📄 Merging PDFs...\n\n⏳ Please wait...\n{_QUEUE_DIVIDER}",
             keyboard=None,
             force=True,
         )
@@ -1092,9 +1092,9 @@ async def pdf_merge_filename_receive(message: Message, state: FSMContext, user_r
             await _edit_merge_status(
                 message.bot, state,
                 f"{_QUEUE_DIVIDER}\n"
-                "âœ… Merge Successful\n\n"
-                f"ðŸ“„ PDFs Merged: {len(files)}\n"
-                f"ðŸ’¾ Output Size: {_format_size(output_size)}\n"
+                "✅ Merge Successful\n\n"
+                f"📄 PDFs Merged: {len(files)}\n"
+                f"💾 Output Size: {_format_size(output_size)}\n"
                 f"{_QUEUE_DIVIDER}\n\n"
                 "Your merged PDF is ready.",
                 keyboard=None,
@@ -1148,7 +1148,7 @@ async def pdf_merge_cancel_ask(query: CallbackQuery, state: FSMContext):
     if current_state == PDFStates.waiting_for_files_merge.state and not files:
         await _merge_full_cleanup(state, chat_id)
         await query.message.edit_text(
-            "ðŸ“„ PDF Toolkit -- choose an operation:",
+            "📄 PDF Toolkit -- choose an operation:",
             reply_markup=get_pdf_menu(),
         )
         logger.info(f"Merge: cancelled with empty queue (no confirmation) by user {query.from_user.id}")
@@ -1161,7 +1161,7 @@ async def pdf_merge_cancel_ask(query: CallbackQuery, state: FSMContext):
     )
     await _edit_merge_status(
         query.bot, state,
-        "âš ï¸ Cancel Merge?\n\n"
+        "⚠️ Cancel Merge?\n\n"
         "Are you sure you want to cancel this merge operation?\n"
         "All uploaded PDFs will be removed.",
         keyboard=_merge_cancel_confirm_keyboard(),
@@ -1174,7 +1174,7 @@ async def pdf_merge_cancel_yes(query: CallbackQuery, state: FSMContext):
     chat_id = query.message.chat.id
     await query.answer()
     await _merge_full_cleanup(state, chat_id)
-    await query.message.edit_text("âŒ Merge cancelled.")
+    await query.message.edit_text("❌ Merge cancelled.")
     logger.info(f"Merge: cancelled by user {query.from_user.id}")
 
 
@@ -1207,7 +1207,7 @@ async def pdf_merge_cancel_no(query: CallbackQuery, state: FSMContext):
         files = await get_tracked_files(state)
         await _edit_merge_status(
             query.bot, state,
-            f"ðŸ“„ Files Added: {len(files)}\n\nðŸ“ Send the output filename (e.g. physics_notes) -- I'll add .pdf for you.",
+            f"📄 Files Added: {len(files)}\n\n📝 Send the output filename (e.g. physics_notes) -- I'll add .pdf for you.",
             keyboard=_merge_filename_keyboard(), force=True,
         )
     else:  # waiting_for_files_merge, either fresh upload or Add More
@@ -1228,7 +1228,7 @@ async def pdf_merge_home(query: CallbackQuery, state: FSMContext):
     await query.answer()
     await _merge_full_cleanup(state, chat_id)
     await query.message.edit_text(
-        "ðŸ“„ PDF Toolkit -- choose an operation:",
+        "📄 PDF Toolkit -- choose an operation:",
         reply_markup=get_pdf_menu(),
     )
     logger.info(f"Merge: returned to PDF Toolkit menu by user {query.from_user.id}")
