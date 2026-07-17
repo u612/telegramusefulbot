@@ -5,7 +5,7 @@ from aiogram.fsm.context import FSMContext
 from typing import Optional
 
 from bot.keyboards.main import get_main_menu
-from bot.handlers.pdf import cancel_pending_merge_batch
+from bot.handlers.pdf import cancel_pending_merge_batch, get_merge_lock
 from core.constants import CB_BACK, CB_HOME, CB_CANCEL
 from core.logger import logger
 from utils.tempfiles import cleanup_tracked_files
@@ -23,11 +23,24 @@ async def _reset_to_main_menu(state: FSMContext, chat_id: Optional[int] = None) 
     Also cancels any pending Merge batch-finalize task for this chat (see
     bot.handlers.pdf) so an abandoned merge queue can't have its status
     message edited by a background task after the flow has ended.
+
+    Runs under the same per-chat merge lock pdf_merge_receive/Done/the
+    filename step use, even for flows that have nothing to do with Merge:
+    it's cheap and uncontended when there's no merge in progress, and it's
+    what stops Cancel/Back/Home/a fresh /start from racing a file that's
+    still mid-download -- without it, a straggling upload could finish and
+    write itself into the FSM state a moment *after* this function had
+    already cleared it, leaking its temp file and leaving a stray entry
+    behind for whatever flow the user opens next.
     """
     if chat_id is not None:
-        cancel_pending_merge_batch(chat_id)
-    await cleanup_tracked_files(state)
-    await state.clear()
+        async with get_merge_lock(chat_id):
+            cancel_pending_merge_batch(chat_id)
+            await cleanup_tracked_files(state)
+            await state.clear()
+    else:
+        await cleanup_tracked_files(state)
+        await state.clear()
 
 
 @router.message(CommandStart())
