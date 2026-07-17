@@ -4,6 +4,8 @@ from aiogram.fsm.state import State, StatesGroup
 class PDFStates(StatesGroup):
     # Merge (multi-file upload + Done button)
     waiting_for_files_merge = State()
+    waiting_for_merge_arrange = State()
+    waiting_for_merge_preview = State()
     waiting_for_merge_filename = State()
 
     # Split
