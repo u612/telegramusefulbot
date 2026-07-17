@@ -1066,6 +1066,13 @@ async def pdf_merge_filename_receive(message: Message, state: FSMContext, user_r
             safe = "merged"
         filename = f"{safe}.pdf"
 
+        # Filename accepted -- keep the chat clean, same as the order
+        # message on the Arrange screen.
+        try:
+            await message.delete()
+        except Exception as e:
+            logger.debug(f"Merge: could not delete user's filename message: {e}")
+
         await _edit_merge_status(
             message.bot, state,
             f"{_QUEUE_DIVIDER}\n📄 Merging PDFs...\n\n⏳ Please wait...\n{_QUEUE_DIVIDER}",
