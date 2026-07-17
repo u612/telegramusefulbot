@@ -36,7 +36,7 @@ from bot.keyboards.pdf import (
 from bot.keyboards.common import back_home_cancel
 from core.constants import (
     CB_PDF, SUPPORTED_PDF_EXTS, SUPPORTED_IMAGE_EXTS, ALLOWED_MIME_TYPES,
-    MERGE_PROGRESS_EDIT_INTERVAL_SECONDS,
+    MERGE_PROGRESS_EDIT_INTERVAL_SECONDS, MERGE_BATCH_FINALIZE_DELAY_SECONDS,
 )
 from core.config import settings
 from core.logger import logger
@@ -72,42 +72,47 @@ _IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp", "image/bmp", "image/tif
 # --------------------------------------------------------------------------
 # Merge queue: single-process, in-memory batch state
 # --------------------------------------------------------------------------
-# Architecture (simplicity and correctness over speed, per explicit
-# request -- no debounce, no timers, no background tasks):
+# Architecture (correctness over speed, per explicit request):
+#
+# Telegram delivers a "media group" (several PDFs sent together) as a rapid
+# burst of separate Message updates, not one atomic update, and there's no
+# signal that says "the album is complete". So instead of downloading and
+# committing each file to the queue as it arrives:
 #
 #   1. Receiving a document ONLY buffers a reference to it (in arrival
 #      order) in memory -- no download yet, nothing added to the queue yet.
-#      Only extension, queue-limit, and Telegram's own file-size metadata
-#      are validated at this point.
-#   2. The very first file of a fresh batch sends one "Receiving your
+#   2. The very first file of a fresh burst sends one "Receiving your
 #      PDFs..." status message immediately, for visual feedback. That
-#      message is never edited again until Done is pressed.
-#   3. When the user presses Done, the buffered list is frozen (and
-#      cleared) under the merge lock, then downloaded and validated
-#      sequentially, strictly in the order the files were buffered. A
-#      file that fails to download or validate is skipped; every other
-#      file is still processed.
-#   4. The committed queue is updated exactly once, after every buffered
-#      file has been handled, and the flow continues into the filename
-#      stage exactly as before.
+#      message is never edited again until the whole burst is processed --
+#      no partial counts, no partial queue, ever.
+#   3. Every new file reschedules a short debounce timer. Once the chat has
+#      been quiet for MERGE_BATCH_FINALIZE_DELAY_SECONDS, the burst is
+#      considered finished.
+#   4. Only then are the buffered files downloaded and validated, ONE AT A
+#      TIME, in the exact order they were buffered, each committed to the
+#      FSM-tracked queue (get_tracked_files/track_temp_file) before moving
+#      to the next.
+#   5. The status message is edited, once, into the final queue view.
 #
-# All of this -- buffering and every read/write of the committed queue --
-# runs under one per-chat asyncio.Lock (get_merge_lock), shared with Done,
-# the actual merge step, and Cancel/Back/Home/a fresh /start (see base.py's
-# `_reset_to_main_menu`). That's what guarantees a buffered file is never
-# lost, never duplicated, and never reordered.
+# All of this -- buffering, downloading, and every read/write of the
+# committed queue -- runs under one per-chat asyncio.Lock (get_merge_lock),
+# shared with Done, the actual merge step, and Cancel/Back/Home/a fresh
+# /start (see base.py's `_reset_to_main_menu`). That's what guarantees a
+# file already buffered is never lost, never duplicated, and never
+# reordered, no matter how Done/Cancel/a new burst interleave with it.
 
 
 class _MergeBatch:
     """Per-chat, in-memory state for one merge flow's not-yet-committed
     uploads. Deliberately NOT stored in FSM data: it holds live aiogram
-    Message objects (needed to actually download each file later), which
-    don't belong in serializable FSM state. Safe as plain in-memory state
-    because the bot runs single-process with aiogram's MemoryStorage
-    already (same assumption the rest of Merge's state relies on).
+    Message objects (needed to actually download each file later) and an
+    asyncio.Task, neither of which belong in serializable FSM state. Safe
+    as plain in-memory state because the bot runs single-process with
+    aiogram's MemoryStorage already (same assumption the rest of Merge's
+    state relies on).
     """
 
-    __slots__ = ("pending", "seen_file_unique_ids")
+    __slots__ = ("pending", "seen_file_unique_ids", "task")
 
     def __init__(self):
         # Ordered list of (message, size_ceiling) tuples, exactly in the
@@ -115,6 +120,7 @@ class _MergeBatch:
         # nothing downstream ever reorders it.
         self.pending: List[tuple] = []
         self.seen_file_unique_ids: set = set()
+        self.task: Optional[asyncio.Task] = None
 
 
 _merge_batches: Dict[int, _MergeBatch] = {}
@@ -133,16 +139,15 @@ _merge_locks: Dict[int, asyncio.Lock] = {}
 
 def get_merge_lock(chat_id: int) -> asyncio.Lock:
     """The single per-chat lock that serializes every piece of code that
-    touches a chat's merge queue: buffering a file, pressing Done
-    (freezing + downloading the buffered list), actually performing the
-    merge, and resetting/cancelling the flow (Cancel/Back/Home/a fresh
-    /start -- see base.py's `_reset_to_main_menu`). Giving all of those
-    one shared lock is what makes "Done pressed while uploads are still
-    arriving" and "Cancel pressed mid-upload" safe: whichever one grabs
-    the lock first runs to completion before the other can see or mutate
-    the queue state, so a buffered upload can never be silently dropped,
-    double counted, reordered, or written into a queue that has already
-    moved on.
+    touches a chat's merge queue: buffering a file, downloading a finished
+    burst, pressing Done, actually performing the merge, and resetting/
+    cancelling the flow (Cancel/Back/Home/a fresh /start -- see base.py's
+    `_reset_to_main_menu`). Giving all of those one shared lock is what
+    makes "Done pressed while uploads are still arriving" and "Cancel
+    pressed mid-upload" safe: whichever one grabs the lock first runs to
+    completion before the other can see or mutate the queue state, so a
+    buffered/downloading upload can never be silently dropped, double
+    counted, reordered, or written into a queue that has already moved on.
     """
     lock = _merge_locks.get(chat_id)
     if lock is None:
@@ -152,18 +157,21 @@ def get_merge_lock(chat_id: int) -> asyncio.Lock:
 
 
 def cancel_pending_merge_batch(chat_id: int) -> None:
-    """Discard any buffered (not-yet-downloaded) files and drop this
-    chat's merge lock from the registry. Called whenever the merge flow
-    leaves the "waiting for files" stage -- Done, Cancel, Back, Home, or a
-    fresh /start.
+    """Cancel any pending merge-batch finalize task, discard any buffered
+    (not-yet-downloaded) files, and drop this chat's merge lock from the
+    registry. Called whenever the merge flow leaves the "waiting for
+    files" stage -- Done, Cancel, Back, Home, or a fresh /start.
 
     Always called by a caller that is itself holding (a local reference
-    to) that very lock, so dropping it from the dict here is safe: the
-    next merge flow to touch this chat simply gets a fresh, uncontended
-    lock. Discarding `pending` here is safe too -- nothing in it has been
-    downloaded to disk yet, so there's nothing to clean up.
+    to) that very lock, so dropping it from the dict here is safe: any
+    task still waiting on it holds its own reference and is unaffected,
+    and the next merge flow to touch this chat simply gets a fresh,
+    uncontended lock. Discarding `pending` here is safe too -- nothing in
+    it has been downloaded to disk yet, so there's nothing to clean up.
     """
-    _merge_batches.pop(chat_id, None)
+    batch = _merge_batches.pop(chat_id, None)
+    if batch and batch.task and not batch.task.done():
+        batch.task.cancel()
     _merge_locks.pop(chat_id, None)
 
 
@@ -173,9 +181,9 @@ def cancel_pending_merge_batch(chat_id: int) -> None:
 
 @router.callback_query(F.data == CB_PDF)
 async def pdf_menu_open(query: CallbackQuery, state: FSMContext):
-    """Opens the PDF submenu from the main menu's "ðŸ“„ PDF" button."""
+    """Opens the PDF submenu from the main menu's "📄 PDF" button."""
     await query.message.edit_text(
-        "ðŸ“„ PDF Toolkit -- choose an operation:",
+        "📄 PDF Toolkit -- choose an operation:",
         reply_markup=get_pdf_menu(),
     )
     await query.answer()
@@ -311,7 +319,7 @@ async def _fail(message: Message, state: FSMContext, error: Exception, cleanup_p
     leave the flow (rather than getting stuck in a dead state).
     """
     if isinstance(error, PDFProcessingError):
-        await message.answer(f"âš ï¸ {error}")
+        await message.answer(f"⚠️ {error}")
     else:
         logger.exception(f"Unexpected PDF processing error: {error}")
         await message.answer("Something went wrong processing that file. Please try again.")
@@ -324,7 +332,7 @@ async def _fail(message: Message, state: FSMContext, error: Exception, cleanup_p
 # Merge queue UI
 # --------------------------------------------------------------------------
 
-_QUEUE_DIVIDER = "â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”"
+_QUEUE_DIVIDER = "━━━━━━━━━━━━━━━━━━━━━━"
 _QUEUE_LATEST_FILES_SHOWN = 5
 
 
@@ -335,8 +343,8 @@ def _render_receiving_text() -> str:
     """
     return (
         f"{_QUEUE_DIVIDER}\n"
-        "ðŸ“„ MERGE QUEUE\n\n"
-        "â³ Receiving your PDFs...\n\n"
+        "📄 MERGE QUEUE\n\n"
+        "⏳ Receiving your PDFs...\n\n"
         "Please wait while all files are detected.\n"
         f"{_QUEUE_DIVIDER}"
     )
@@ -345,11 +353,11 @@ def _render_receiving_text() -> str:
 def _render_queue_updated_text(count: int, file_names: List[str], failed: Optional[List[str]] = None) -> str:
     lines = [
         _QUEUE_DIVIDER,
-        "ðŸ“„ MERGE QUEUE",
+        "📄 MERGE QUEUE",
         "",
-        "âœ… Queue Updated",
+        "✅ Queue Updated",
         "",
-        "ðŸ“¦ Total PDFs:",
+        "📦 Total PDFs:",
         str(count),
         "",
     ]
@@ -357,16 +365,16 @@ def _render_queue_updated_text(count: int, file_names: List[str], failed: Option
         lines.append("Latest files:")
         lines.append("")
         for name in file_names[-_QUEUE_LATEST_FILES_SHOWN:]:
-            lines.append(f"â€¢ {name}")
+            lines.append(f"• {name}")
         remaining = count - _QUEUE_LATEST_FILES_SHOWN
         lines.append("")
         lines.append(f"...and {remaining} more")
         lines.append("")
-        lines.append("Press âœ… Done")
+        lines.append("Press ✅ Done")
     elif count > 0:
         lines.append("Ready to merge.")
         lines.append("")
-        lines.append("Press âœ… Done when finished.")
+        lines.append("Press ✅ Done when finished.")
     else:
         lines.append("No PDFs were added.")
         lines.append("")
@@ -376,7 +384,7 @@ def _render_queue_updated_text(count: int, file_names: List[str], failed: Option
     if failed:
         shown = ", ".join(failed[:5])
         more = "" if len(failed) <= 5 else f", and {len(failed) - 5} more"
-        text += f"\n\nâš ï¸ Skipped {len(failed)} file(s) that failed to download or weren't valid PDFs: {shown}{more}"
+        text += f"\n\n⚠️ Skipped {len(failed)} file(s) that failed to download or weren't valid PDFs: {shown}{more}"
     return text
 
 
@@ -500,8 +508,46 @@ async def _process_pending_batch(state: FSMContext, chat_id: int, bot_config_rep
     return added, failed
 
 
+async def _finalize_merge_batch(bot, state: FSMContext, chat_id: int, bot_config_repo) -> None:
+    """Runs MERGE_BATCH_FINALIZE_DELAY_SECONDS after the most recently
+    buffered file; if nothing newer has rescheduled it in the meantime,
+    the burst is considered complete: download + commit every buffered
+    file (in order), then do the single "✅ Queue Updated" edit.
+    """
+    try:
+        await asyncio.sleep(MERGE_BATCH_FINALIZE_DELAY_SECONDS)
+    except asyncio.CancelledError:
+        return
+
+    async with get_merge_lock(chat_id):
+        batch = _merge_batches.get(chat_id)
+        if batch is None or batch.task is not asyncio.current_task():
+            return  # a newer file superseded this task, or the flow ended
+        batch.task = None
+
+        if await state.get_state() != PDFStates.waiting_for_files_merge.state:
+            return  # flow was cancelled/finished/navigated away in the meantime
+
+        added, failed = await _process_pending_batch(state, chat_id, bot_config_repo)
+        if not added and not failed:
+            return  # nothing was actually buffered (shouldn't normally happen)
+
+        total = len(await get_tracked_files(state))
+        file_names = list((await state.get_data()).get("merge_file_names", []))
+        await _edit_merge_status(
+            bot, state,
+            _render_queue_updated_text(total, file_names, failed),
+            keyboard=merge_queue_keyboard(),
+            force=True,
+        )
+        logger.info(
+            f"Merge: batch finalized for chat {chat_id}: "
+            f"{len(added)} added, {len(failed)} failed, total={total}"
+        )
+
+
 # --------------------------------------------------------------------------
-# Merge (buffer -> Done -> download-in-order -> commit)
+# Merge (buffer -> debounce -> download-in-order -> commit)
 # --------------------------------------------------------------------------
 
 @router.callback_query(F.data == PDF_MERGE)
@@ -510,7 +556,7 @@ async def pdf_merge_start(query: CallbackQuery, state: FSMContext):
     _merge_batches.pop(chat_id, None)  # defensive: no stale buffer from a previous flow
     await state.set_state(PDFStates.waiting_for_files_merge)
     await query.message.edit_text(
-        "ðŸ“„ Send the PDF files you want to merge, in order (you can send several at once).\n"
+        "📄 Send the PDF files you want to merge, in order (you can send several at once).\n"
         "I'll keep a running queue right here -- press Done when you're finished.",
         reply_markup=merge_queue_keyboard(),
     )
@@ -531,18 +577,19 @@ async def pdf_merge_receive(message: Message, state: FSMContext, user_repo=None,
     chat_id = message.chat.id
 
     if not validate_extension(doc.file_name or "", SUPPORTED_PDF_EXTS):
-        await message.answer("âŒ Please send PDF files only.")
+        await message.answer("❌ Please send PDF files only.")
         logger.info(f"Merge: rejected non-PDF document '{doc.file_name}' from user {user_id}")
         return
 
     limits = get_effective_limits(user_id, db_user)
 
     # Everything that touches this chat's buffer or committed queue runs
-    # under one lock -- see get_merge_lock's docstring. Receiving a file
-    # only buffers a reference to it -- no download, no timers, no
-    # background tasks -- so this critical section is fast regardless of
-    # file size, and the whole album gets buffered in order; nothing is
-    # downloaded until Done is pressed.
+    # under one lock -- see get_merge_lock's docstring. Note that unlike the
+    # old design, the (slow) download itself does NOT happen inside this
+    # per-file lock acquisition anymore: receiving a file only buffers a
+    # reference to it, so this critical section is fast regardless of file
+    # size, and the whole album gets buffered in order before any network
+    # I/O for downloading starts.
     lock = get_merge_lock(chat_id)
     async with lock:
         batch = _get_merge_batch(chat_id)
@@ -579,14 +626,20 @@ async def pdf_merge_receive(message: Message, state: FSMContext, user_repo=None,
         batch.pending.append((message, size_ceiling))
         logger.info(f"Merge: buffered file #{len(batch.pending)} of current burst for user {user_id} ('{doc.file_name}')")
 
-        # Requirement: immediate feedback, but only once per batch, and
+        # Requirement: immediate feedback, but only once per burst, and
         # never a partial/running-count queue. The very first file of a
-        # fresh batch (nothing buffered yet before this file) sends the
-        # single "Receiving..." message; every subsequent file leaves it
-        # untouched. Nothing else happens here -- downloading only starts
-        # once the user presses Done.
-        if len(batch.pending) == 1:
+        # fresh burst (no batch task currently active) sends the single
+        # "Receiving..." message; every subsequent file in the same burst
+        # leaves it untouched.
+        if batch.task is None or batch.task.done():
             await _start_new_queue_message(message.bot, state, chat_id, _render_receiving_text())
+
+        previous_task = batch.task
+        if previous_task and not previous_task.done():
+            previous_task.cancel()
+        batch.task = asyncio.create_task(
+            _finalize_merge_batch(message.bot, state, chat_id, bot_config_repo)
+        )
 
 
 @router.message(PDFStates.waiting_for_files_merge)
@@ -595,39 +648,42 @@ async def pdf_merge_reject_wrong_input(message: Message):
     voice, audio, plain text, GIFs, stickers, etc.) -- reply politely
     instead of ever crashing or silently ignoring it.
     """
-    await message.answer("âŒ Please send PDF files only.")
+    await message.answer("❌ Please send PDF files only.")
 
 
 @router.callback_query(PDFStates.waiting_for_files_merge, F.data == PDF_DONE)
 async def pdf_merge_done(query: CallbackQuery, state: FSMContext, bot_config_repo=None):
     chat_id = query.message.chat.id
     await query.answer()
-    # Shares the lock with pdf_merge_receive: if a file is still being
-    # buffered when Done is pressed, this waits its turn, then freezes and
-    # downloads everything currently buffered before reading the final
-    # count -- so a straggling upload is always counted in, never silently
-    # dropped.
+    # Shares the lock with pdf_merge_receive/_finalize_merge_batch: if a
+    # burst is still being collected or is mid-download when Done is
+    # pressed, this waits its turn, then immediately drains and downloads
+    # whatever is still buffered (rather than just waiting for the natural
+    # debounce) before reading the final count -- so a straggling upload
+    # is always counted in, never silently dropped.
     async with get_merge_lock(chat_id):
         batch = _merge_batches.get(chat_id)
         failed: List[str] = []
-        if batch is not None and batch.pending:
+        if batch is not None:
+            if batch.task and not batch.task.done():
+                batch.task.cancel()
             added, failed = await _process_pending_batch(state, chat_id, bot_config_repo)
             if added or failed:
-                logger.info(f"Merge: processed {len(added)} buffered file(s) ({len(failed)} failed) on Done for user {query.from_user.id}")
+                logger.info(f"Merge: drained {len(added)} buffered file(s) ({len(failed)} failed) on Done for user {query.from_user.id}")
         cancel_pending_merge_batch(chat_id)
 
         files = await get_tracked_files(state)
         if len(files) < 2:
             msg = "Need at least 2 PDF files to merge. Send more files, or press Cancel."
             if failed:
-                msg += f"\n\nâš ï¸ {len(failed)} file(s) failed to process and were skipped."
+                msg += f"\n\n⚠️ {len(failed)} file(s) failed to process and were skipped."
             await query.message.answer(msg)
             return
 
         await state.set_state(PDFStates.waiting_for_merge_filename)
-        text = f"ðŸ“„ Files Added: {len(files)}\n\nðŸ“ Send the output filename (e.g. physics_notes) -- I'll add .pdf for you."
+        text = f"📄 Files Added: {len(files)}\n\n📝 Send the output filename (e.g. physics_notes) -- I'll add .pdf for you."
         if failed:
-            text += f"\n\nâš ï¸ {len(failed)} file(s) failed to process and were skipped."
+            text += f"\n\n⚠️ {len(failed)} file(s) failed to process and were skipped."
         await _edit_merge_status(
             query.bot, state, text,
             keyboard=back_home_cancel(),
@@ -646,6 +702,8 @@ async def pdf_merge_filename_receive(message: Message, state: FSMContext, user_r
     async with get_merge_lock(chat_id):
         batch = _merge_batches.get(chat_id)
         if batch is not None and batch.pending:
+            if batch.task and not batch.task.done():
+                batch.task.cancel()
             await _process_pending_batch(state, chat_id, bot_config_repo)
         cancel_pending_merge_batch(chat_id)
 
