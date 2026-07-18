@@ -13,14 +13,16 @@ Two pieces live here:
    for Maximum also strip metadata) on top -- also already a dependency,
    so still no new packages.
 
-   Best Quality / Balanced / Maximum are three genuinely different
-   Ghostscript parameter sets (resolution, JPEG quality, and -- the part
-   the previous version was missing -- the image *downsample threshold*,
-   which controls whether an image close to the target resolution gets
-   touched at all). Target File Size no longer walks a fixed ladder and
-   stops at the first profile under the target; it binary-searches JPEG
-   quality within each resolution tier so the result is the closest
-   possible size at or under the target, never over it.
+   Every mode now has a small, fixed upper bound on how many times
+   Ghostscript can run, so nothing can hang a Telegram bot:
+     - Best Quality / Balanced: exactly 1 Ghostscript run.
+     - Maximum: 1 run, plus at most 1 stronger fallback if the first
+       run didn't achieve a meaningful reduction (2 total, never more).
+     - Target File Size: runs a fixed list of at most 6 profiles
+       (high quality -> low), stopping as soon as one is small enough,
+       and picks the largest one that's still <= the target. No binary
+       search, no per-PDF convergence loop -- worst case is 6 Ghostscript
+       calls, same as best case for a target that's hard to hit.
 
 Both PyMuPDF and Ghostscript are already required by this project
 (requirements.txt / Dockerfile respectively) -- no new dependencies.
@@ -53,9 +55,9 @@ CompressionLevel = CompressionMode
 _UNSET = object()
 
 # A result is only considered a "meaningful" reduction if it saves at
-# least this fraction of the original size. Below this, Problem 3's
-# escalation kicks in (for modes that support it) before we conclude the
-# PDF is genuinely already optimized.
+# least this fraction of the original size. Below this, Maximum's single
+# fallback attempt (see _MAXIMUM_FALLBACK) kicks in before we're willing
+# to call the PDF genuinely already optimized.
 _MEANINGFUL_REDUCTION = 0.03
 
 
@@ -77,11 +79,10 @@ class _GsProfile:
 # Three deliberately different strategies -- not small variations of one
 # another. Best Quality barely touches images and never forces a
 # downsample unless an image is grossly oversized. Balanced is the
-# every-day tradeoff. Maximum uses the lowest resolution/quality *and*
-# threshold=1.0, so -- unlike the old /screen-only setting -- it actually
-# forces every image down to its target DPI even if a prior compression
-# pass already left it "close enough", which is what was causing already
-# -compressed files to fall straight through to "already optimized".
+# every-day tradeoff, one Ghostscript run, no retries. Maximum uses the
+# lowest resolution/quality *and* threshold=1.0, so it actually forces
+# every image down to its target DPI even if a prior compression pass
+# already left it "close enough".
 _PROFILES = {
     CompressionMode.BEST_QUALITY: _GsProfile(
         "best_quality", "/prepress", image_dpi=250, mono_dpi=450, jpeg_q=95,
@@ -97,40 +98,33 @@ _PROFILES = {
     ),
 }
 
-# Escalation fallback used only when the assigned profile's result doesn't
-# clear _MEANINGFUL_REDUCTION -- see Problem 3. Each mode escalates to a
-# strictly more aggressive profile before we're willing to call a file
-# "already optimized". Best Quality intentionally has no escalation: a
-# small reduction is its whole point, not a bug.
-_ESCALATION = {
-    CompressionMode.BALANCED: _GsProfile(
-        "balanced_escalated", "/screen", image_dpi=100, mono_dpi=200, jpeg_q=55,
-        downsample_threshold=1.0, clean="gc",
-    ),
-    CompressionMode.MAXIMUM: _GsProfile(
-        "maximum_escalated", "/screen", image_dpi=55, mono_dpi=110, jpeg_q=25,
-        downsample_threshold=1.0, clean="strip",
-    ),
-}
+# Maximum's single allowed fallback (see Problem 2 / Problem 4): if the
+# primary Maximum profile doesn't clear _MEANINGFUL_REDUCTION, try this
+# ONE strictly-more-aggressive profile, then stop no matter what. Total
+# Ghostscript executions for Maximum is therefore capped at 2, always.
+_MAXIMUM_FALLBACK = _GsProfile(
+    "maximum_fallback", "/screen", image_dpi=55, mono_dpi=110, jpeg_q=25,
+    downsample_threshold=1.0, clean="strip",
+)
 
-# Resolution tiers for the Target File Size search, high to low. For each
-# tier we binary-search JPEG quality to find the largest (closest-to
-# -target) size that still doesn't exceed the target, then stop at the
-# first (highest-resolution) tier where that's achievable at all --
-# a lower tier can only produce a same-or-smaller ceiling, so it can't
-# beat what a higher tier already found.
-_TARGET_DPI_TIERS: List[int] = [300, 240, 190, 150, 120, 96, 75, 60, 45]
-_TARGET_Q_MIN = 20
-_TARGET_Q_MAX = 95
-
-
-def _tier_profile(dpi: int, jpeg_q: int) -> _GsProfile:
-    pdfsettings = "/printer" if dpi >= 200 else ("/ebook" if dpi >= 110 else "/screen")
-    mono_dpi = max(120, int(dpi * 1.6))
-    return _GsProfile(
-        f"tier_{dpi}_{jpeg_q}", pdfsettings, image_dpi=dpi, mono_dpi=mono_dpi,
-        jpeg_q=jpeg_q, downsample_threshold=1.0, clean="gc",
-    )
+# Fixed profile ladder for Target File Size -- high quality/size to low.
+# At most one Ghostscript run per entry, at most len() entries total, so
+# the whole search is bounded at a hard 6 runs. No binary search, no
+# convergence loop: pick whichever prebuilt profile is closest.
+_TARGET_LADDER: List[_GsProfile] = [
+    _GsProfile("target_1", "/printer", image_dpi=220, mono_dpi=350, jpeg_q=90,
+               downsample_threshold=1.0, clean="gc"),
+    _GsProfile("target_2", "/printer", image_dpi=170, mono_dpi=280, jpeg_q=78,
+               downsample_threshold=1.0, clean="gc"),
+    _GsProfile("target_3", "/ebook", image_dpi=130, mono_dpi=220, jpeg_q=65,
+               downsample_threshold=1.0, clean="gc"),
+    _GsProfile("target_4", "/ebook", image_dpi=100, mono_dpi=170, jpeg_q=52,
+               downsample_threshold=1.0, clean="gc"),
+    _GsProfile("target_5", "/screen", image_dpi=75, mono_dpi=130, jpeg_q=38,
+               downsample_threshold=1.0, clean="strip"),
+    _GsProfile("target_6", "/screen", image_dpi=50, mono_dpi=100, jpeg_q=25,
+               downsample_threshold=1.0, clean="strip"),
+]
 
 
 @dataclass(frozen=True)
@@ -222,6 +216,10 @@ class PDFCompressor:
         and `target_achieved` (bool). `timeout` should come from the
         caller's effective limits (utils.limits) -- pass None explicitly
         for no timeout (the owner); omit it for the settings default.
+
+        Ghostscript execution counts are hard-capped per mode: Best
+        Quality/Balanced = 1, Maximum = 2, Target File Size = 6. None of
+        these can loop or grow with PDF size/content.
         """
         if shutil.which("gs") is None:
             raise PDFProcessingError(
@@ -255,21 +253,21 @@ class PDFCompressor:
         output_path = await self._run_gs_clean(input_path, profile, timeout)
         compressed_size = os.path.getsize(output_path)
 
-        # Problem 3: don't declare "already optimized" after a single
-        # attempt. If this mode has an escalation profile and the result
-        # didn't clear the meaningful-reduction bar, genuinely try harder
-        # before giving up.
-        escalation = _ESCALATION.get(mode)
-        if escalation is not None and original_size > 0:
+        # Maximum only: one bounded fallback attempt (never a loop) if
+        # the first run didn't achieve a meaningful reduction. Best
+        # Quality and Balanced never retry -- exactly 1 Ghostscript run.
+        if mode == CompressionMode.MAXIMUM and original_size > 0:
             reduction = (original_size - compressed_size) / original_size
             if reduction < _MEANINGFUL_REDUCTION:
-                escalated_path = await self._run_gs_clean(input_path, escalation, timeout)
-                escalated_size = os.path.getsize(escalated_path)
-                if escalated_size < compressed_size:
+                fallback_path = await self._run_gs_clean(input_path, _MAXIMUM_FALLBACK, timeout)
+                fallback_size = os.path.getsize(fallback_path)
+                if fallback_size < compressed_size:
                     delete_path(output_path)
-                    output_path, compressed_size = escalated_path, escalated_size
+                    output_path, compressed_size = fallback_path, fallback_size
                 else:
-                    delete_path(escalated_path)
+                    delete_path(fallback_path)
+                # Whether or not the fallback helped, we stop here --
+                # this is the one and only retry Maximum is allowed.
 
         if compressed_size >= original_size:
             delete_path(output_path)
@@ -333,12 +331,13 @@ class PDFCompressor:
         return output_path
 
     async def _run_gs_clean(self, input_path: str, profile: _GsProfile, timeout) -> str:
-        """Run Ghostscript, then (for modes that ask for it) a PyMuPDF
-        object-optimization / metadata-cleanup pass on top: garbage
+        """Run Ghostscript, then (for modes/tiers that ask for it) a
+        PyMuPDF object-optimization / metadata-cleanup pass on top: gc
         -collect unused objects and re-deflate streams ("gc"), or do
-        that plus strip document metadata entirely ("strip", Maximum
-        only). Best Quality skips this ("none") to avoid touching
-        anything beyond image re-encoding.
+        that plus strip document metadata entirely ("strip"). Best
+        Quality skips this ("none") to avoid touching anything beyond
+        image re-encoding. This is a single extra local operation, not a
+        Ghostscript run, so it doesn't count against any execution cap.
         """
         gs_output = await self._run_gs(input_path, profile, timeout)
         if profile.clean == "none":
@@ -374,76 +373,33 @@ class PDFCompressor:
         return gs_output
 
     async def _search_target_size(self, input_path: str, target_bytes: int, timeout) -> Tuple[str, bool]:
-        """Binary-searches JPEG quality within each resolution tier
-        (highest first) to find the largest file that still does not
-        exceed `target_bytes`. Never returns a candidate above the
-        target if any candidate at or under it was found anywhere in
-        the search; only falls back to the smallest achievable size
-        (which may exceed the target) if the target is below what the
-        PDF can physically be compressed to.
+        """Runs the fixed _TARGET_LADDER (high quality -> low), at most
+        one Ghostscript execution per entry. Stops as soon as an entry's
+        output is <= target_bytes -- since the ladder is ordered from
+        largest-expected-output to smallest, the first one that fits is
+        already the largest (closest) valid result, so there's no need
+        to keep going. If nothing in the ladder fits, returns the
+        smallest candidate seen and flags target_achieved=False. Hard
+        upper bound: len(_TARGET_LADDER) == 6 Ghostscript runs, always.
         """
-        best_path: Optional[str] = None
-        best_size: Optional[int] = None
-        smallest_seen_path: Optional[str] = None
-        smallest_seen_size: Optional[int] = None
+        smallest_path: Optional[str] = None
+        smallest_size: Optional[int] = None
 
-        def _keep_smallest_seen(path: str, size: int):
-            nonlocal smallest_seen_path, smallest_seen_size
-            if smallest_seen_size is None or size < smallest_seen_size:
-                if smallest_seen_path is not None:
-                    delete_path(smallest_seen_path)
-                smallest_seen_path, smallest_seen_size = path, size
+        for profile in _TARGET_LADDER:
+            candidate_path = await self._run_gs(input_path, profile, timeout)
+            candidate_size = os.path.getsize(candidate_path)
+
+            if candidate_size <= target_bytes:
+                if smallest_path is not None:
+                    delete_path(smallest_path)
+                return candidate_path, True
+
+            if smallest_size is None or candidate_size < smallest_size:
+                if smallest_path is not None:
+                    delete_path(smallest_path)
+                smallest_path, smallest_size = candidate_path, candidate_size
             else:
-                delete_path(path)
+                delete_path(candidate_path)
 
-        for dpi in _TARGET_DPI_TIERS:
-            # Try the top of the quality range for this tier first.
-            high_path = await self._run_gs(input_path, _tier_profile(dpi, _TARGET_Q_MAX), timeout)
-            high_size = os.path.getsize(high_path)
-
-            if high_size <= target_bytes:
-                # Whole tier fits even at max quality -- this is the
-                # closest result available at this (highest-so-far)
-                # resolution; no need to search further tiers.
-                best_path, best_size = high_path, high_size
-                break
-
-            _keep_smallest_seen(high_path, high_size)
-
-            low_path = await self._run_gs(input_path, _tier_profile(dpi, _TARGET_Q_MIN), timeout)
-            low_size = os.path.getsize(low_path)
-
-            if low_size > target_bytes:
-                # Not achievable at all at this resolution; drop to the
-                # next lower tier.
-                _keep_smallest_seen(low_path, low_size)
-                continue
-
-            # Straddles the target within this tier: binary-search
-            # quality to find the largest value that still fits.
-            lo, hi = _TARGET_Q_MIN, _TARGET_Q_MAX
-            candidate_path, candidate_size = low_path, low_size
-            while lo + 1 < hi:
-                mid = (lo + hi) // 2
-                mid_path = await self._run_gs(input_path, _tier_profile(dpi, mid), timeout)
-                mid_size = os.path.getsize(mid_path)
-                if mid_size <= target_bytes:
-                    delete_path(candidate_path)
-                    candidate_path, candidate_size = mid_path, mid_size
-                    lo = mid
-                else:
-                    _keep_smallest_seen(mid_path, mid_size)
-                    hi = mid
-            delete_path(high_path)
-            best_path, best_size = candidate_path, candidate_size
-            break
-
-        if best_path is not None:
-            if smallest_seen_path is not None:
-                delete_path(smallest_seen_path)
-            return best_path, True
-
-        # Target was below what's physically achievable -- return the
-        # smallest size found across the whole search as the best-effort
-        # result and flag that the target wasn't reached.
-        return smallest_seen_path, False
+        # Exhausted the ladder without hitting the target -- best effort.
+        return smallest_path, False
