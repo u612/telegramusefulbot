@@ -19,9 +19,13 @@ class PDFStates(StatesGroup):
     waiting_for_split_every_preview = State()
     waiting_for_split_large_confirm = State()
 
-    # Compress
-    waiting_for_compress_level = State()
+    # Compress (redesigned to match Merge/Split's UX: PDF -> analyze ->
+    # choose mode -> preview -> compress)
     waiting_for_file_compress = State()
+    waiting_for_compress_method = State()
+    waiting_for_compress_preview = State()
+    waiting_for_compress_target_input = State()
+    waiting_for_compress_target_preview = State()
 
     # Rotate
     waiting_for_rotate_angle = State()
