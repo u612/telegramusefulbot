@@ -824,10 +824,15 @@ async def pdf_merge_receive(message: Message, state: FSMContext, user_repo=None,
 @router.message(PDFStates.waiting_for_files_merge)
 async def pdf_merge_reject_wrong_input(message: Message):
     """Everything that isn't a document reaches here (photos, videos,
-    voice, audio, plain text, GIFs, stickers, etc.) -- reply politely
-    instead of ever crashing or silently ignoring it.
+    voice, audio, plain text, GIFs, stickers, etc.). Per spec: the user's
+    invalid message is deleted, and the validation reply auto-expires
+    after ~7s -- never left cluttering the chat.
     """
-    await message.answer("❌ Please send PDF files only.")
+    try:
+        await message.delete()
+    except Exception as e:
+        logger.debug(f"Merge: could not delete user's invalid upload message: {e}")
+    await _send_temp_validation_error(message.bot, message.chat.id, "❌ Please send PDF files only.")
 
 
 async def _enter_arrange_screen(bot, state: FSMContext, preserve_order: bool) -> None:
@@ -946,7 +951,18 @@ async def pdf_merge_arrange_receive(message: Message, state: FSMContext):
 
 @router.message(PDFStates.waiting_for_merge_arrange)
 async def pdf_merge_arrange_wrong_input(message: Message):
-    await message.answer("Please send the new order as numbers separated by commas, e.g. 3,1,2.")
+    """Catches non-text input (photo, sticker, etc.) while waiting for the
+    order string. Same treatment as every other invalid input in Merge:
+    delete the user's message, show a temporary validation error.
+    """
+    try:
+        await message.delete()
+    except Exception as e:
+        logger.debug(f"Merge: could not delete user's invalid (non-text) order message: {e}")
+    await _send_temp_validation_error(
+        message.bot, message.chat.id,
+        "⚠️ Please send the new order as numbers separated by commas, e.g. 3,1,2.",
+    )
 
 
 @router.callback_query(PDFStates.waiting_for_merge_arrange, F.data == MERGE_CB_PROCEED_CURRENT_ORDER)
@@ -1118,7 +1134,18 @@ async def pdf_merge_filename_receive(message: Message, state: FSMContext, user_r
 
 @router.message(PDFStates.waiting_for_merge_filename)
 async def pdf_merge_filename_wrong_input(message: Message):
-    await message.answer("Please send the output filename as text (e.g. physics_notes).")
+    """Catches non-text input (photo, sticker, etc.) while waiting for the
+    output filename. Same treatment as every other invalid input in
+    Merge: delete the user's message, show a temporary validation error.
+    """
+    try:
+        await message.delete()
+    except Exception as e:
+        logger.debug(f"Merge: could not delete user's invalid (non-text) filename message: {e}")
+    await _send_temp_validation_error(
+        message.bot, message.chat.id,
+        "⚠️ Please send the output filename as text (e.g. physics_notes).",
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1219,6 +1246,40 @@ async def pdf_merge_cancel_no(query: CallbackQuery, state: FSMContext):
             _render_queue_updated_text(len(sizes), sizes, add_more=add_more),
             keyboard=_merge_upload_keyboard(), force=True,
         )
+
+
+# --------------------------------------------------------------------------
+# Stale-button safety net -- registered last among the Merge callback
+# handlers above, so it only ever fires when none of the state-scoped ones
+# matched. This happens when /start (or Cancel/Home from another flow) has
+# cleared the FSM state but the old Merge message with its inline keyboard
+# is still visible on screen: pressing one of those old buttons no longer
+# matches any PDFStates-filtered handler, so without this Telegram would
+# just spin on "loading" forever with no reply. base.py's
+# _reset_to_main_menu already strips the keyboard on reset as the primary
+# fix; this is a backstop for anything still reachable (e.g. a button
+# pressed in the brief window before the edit lands).
+# --------------------------------------------------------------------------
+
+_MERGE_ALL_CALLBACKS = {
+    PDF_DONE,
+    MERGE_CB_CANCEL,
+    MERGE_CB_CANCEL_YES,
+    MERGE_CB_CANCEL_NO,
+    MERGE_CB_PROCEED_CURRENT_ORDER,
+    MERGE_CB_CONFIRM,
+    MERGE_CB_REARRANGE_AGAIN,
+    MERGE_CB_ADD_MORE,
+}
+
+
+@router.callback_query(StateFilter(None), F.data.in_(_MERGE_ALL_CALLBACKS))
+async def pdf_merge_stale_callback(query: CallbackQuery):
+    await query.answer("This session has expired. Please start again from the menu.", show_alert=True)
+    try:
+        await query.message.edit_reply_markup(reply_markup=None)
+    except Exception as e:
+        logger.debug(f"Merge: could not strip keyboard from stale callback message: {e}")
 
 
 # --------------------------------------------------------------------------
