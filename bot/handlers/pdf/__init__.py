@@ -10,7 +10,11 @@ from aiogram.fsm.context import FSMContext
 from bot.keyboards.pdf import get_pdf_menu
 from core.constants import CB_PDF
 
-from .merge import router as merge_router
+from .merge import (
+    router as merge_router,
+    cancel_pending_merge_batch,
+    get_merge_lock,
+)
 from .split import router as split_router
 from .compress import router as compress_router
 from .rotate import router as rotate_router
