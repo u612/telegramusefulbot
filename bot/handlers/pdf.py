@@ -2481,4 +2481,641 @@ def _parse_target_size_mb(text: str, original_size: Optional[int]) -> int:
     try:
         value = float(text.strip())
     except ValueError:
-  
+        raise ValueError("Invalid target size.\n\nEnter a value smaller than the original PDF size.\n\nExample\n10")
+    if value <= 0:
+        raise ValueError("Invalid target size.\n\nEnter a value smaller than the original PDF size.\n\nExample\n10")
+    target_bytes = int(value * 1024 * 1024)
+    if original_size and target_bytes >= original_size:
+        raise ValueError("Invalid target size.\n\nEnter a value smaller than the original PDF size.\n\nExample\n10")
+    return target_bytes
+
+
+async def _replace_compress_message(bot, state: FSMContext, chat_id: int, text: str, keyboard=None) -> None:
+    """Delete the previous Compress status message (if any) and send a
+    fresh one -- same pattern as Merge/Split's status message."""
+    data = await state.get_data()
+    old_chat_id = data.get("compress_status_chat_id")
+    old_message_id = data.get("compress_status_message_id")
+    if old_chat_id is not None and old_message_id is not None:
+        try:
+            await bot.delete_message(chat_id=old_chat_id, message_id=old_message_id)
+        except Exception as e:
+            logger.debug(f"Compress: status delete skipped: {e}")
+
+    sent = await bot.send_message(chat_id, text, reply_markup=keyboard)
+    await state.update_data(compress_status_chat_id=chat_id, compress_status_message_id=sent.message_id)
+
+
+async def _edit_compress_message(bot, state: FSMContext, text: str, keyboard=None) -> None:
+    data = await state.get_data()
+    chat_id = data.get("compress_status_chat_id")
+    message_id = data.get("compress_status_message_id")
+    if chat_id is None or message_id is None:
+        return
+    try:
+        await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=keyboard)
+    except Exception as e:
+        logger.debug(f"Compress: status edit skipped: {e}")
+
+
+async def _compress_full_cleanup(state: FSMContext, chat_id: int) -> None:
+    for key in [k for k in _compress_pending_groups if k.startswith(f"{chat_id}:")]:
+        _compress_pending_groups.pop(key, None)
+        task = _compress_group_tasks.pop(key, None)
+        if task and not task.done():
+            task.cancel()
+    files = await get_tracked_files(state)
+    if files:
+        delete_paths(files)
+        await untrack_temp_files(state, files)
+    await state.clear()
+
+
+async def _reject_compress_upload(message: Message, reason: str) -> None:
+    try:
+        await message.delete()
+    except Exception as e:
+        logger.debug(f"Compress: could not delete invalid upload message: {e}")
+    await _send_temp_validation_error(message.bot, message.chat.id, reason)
+
+
+# --------------------------------------------------------------------------
+# Compress -- Section 1/2: entry + waiting for PDF
+# --------------------------------------------------------------------------
+
+@router.callback_query(F.data == PDF_COMPRESS)
+async def pdf_compress_start(query: CallbackQuery, state: FSMContext):
+    chat_id = query.message.chat.id
+    await state.set_state(PDFStates.waiting_for_file_compress)
+    await query.message.edit_text(
+        f"{_QUEUE_DIVIDER}\n"
+        "📦 Compress PDF\n\n"
+        "Send one PDF to compress.\n\n"
+        "Supported methods:\n"
+        "• 🟢 Best Quality\n"
+        "• 🟡 Balanced\n"
+        "• 🔴 Maximum Compression\n"
+        "• 🎯 Target File Size\n\n"
+        "📄 Send one PDF to begin.\n"
+        f"{_QUEUE_DIVIDER}",
+        reply_markup=_compress_upload_keyboard(),
+    )
+    await state.update_data(
+        compress_status_chat_id=chat_id,
+        compress_status_message_id=query.message.message_id,
+    )
+    await query.answer()
+
+
+async def _process_single_compress_pdf(message: Message, state: FSMContext, db_user=None) -> None:
+    """Section 3/3A/4: download + validate, show 'PDF Loaded', analyze,
+    then show the method-selection screen with the analysis + recommendation.
+    """
+    path = await _download_and_validate(message, state, SUPPORTED_PDF_EXTS, _PDF_MIME, "PDF", db_user=db_user)
+    if path is None:
+        return
+
+    try:
+        reader = open_pdf_reader(path)
+        page_count = check_page_count(reader, min_pages=1)
+    except PDFProcessingError as e:
+        await untrack_temp_files(state, [path])
+        delete_paths([path])
+        await _send_temp_validation_error(message.bot, message.chat.id, f"❌ {e}")
+        return
+
+    filename = message.document.file_name or "document.pdf"
+    size_bytes = message.document.file_size
+
+    await state.update_data(
+        compress_input_path=path,
+        compress_filename=filename,
+        compress_page_count=page_count,
+        compress_file_size=size_bytes,
+    )
+
+    sent = await message.answer(_render_compress_loaded_text(filename, page_count, size_bytes))
+    await state.update_data(compress_status_chat_id=message.chat.id, compress_status_message_id=sent.message_id)
+
+    try:
+        analysis = await PDFCompressor().analyze(path)
+    except PDFProcessingError as e:
+        await untrack_temp_files(state, [path])
+        delete_paths([path])
+        await _send_temp_validation_error(message.bot, message.chat.id, f"❌ {e}")
+        await state.clear()
+        return
+
+    await state.update_data(
+        compress_recommended=analysis.recommended.value,
+        compress_doc_type=analysis.doc_type,
+        compress_image_count=analysis.image_count,
+        compress_text_amount=analysis.text_amount,
+    )
+    await state.set_state(PDFStates.waiting_for_compress_method)
+    await _edit_compress_message(
+        message.bot, state,
+        _render_compress_analysis_text(analysis, page_count),
+        _compress_method_keyboard(),
+    )
+
+
+async def _finalize_compress_media_group(key: str, state: FSMContext, db_user) -> None:
+    try:
+        await asyncio.sleep(MERGE_BATCH_FINALIZE_DELAY_SECONDS)
+    except asyncio.CancelledError:
+        return
+    group = _compress_pending_groups.pop(key, None)
+    _compress_group_tasks.pop(key, None)
+    if not group:
+        return
+    if await state.get_state() != PDFStates.waiting_for_file_compress.state:
+        return
+
+    if len(group) > 1:
+        for m in group:
+            try:
+                await m.delete()
+            except Exception as e:
+                logger.debug(f"Compress: could not delete rejected album message: {e}")
+        await _send_temp_validation_error(
+            group[0].bot, group[0].chat.id,
+            "❌ Please send only ONE PDF.\n\nCompression works with one document at a time.",
+        )
+        return
+
+    await _process_single_compress_pdf(group[0], state, db_user=db_user)
+
+
+@router.message(PDFStates.waiting_for_file_compress, F.document)
+async def pdf_compress_receive(message: Message, state: FSMContext, db_user=None):
+    doc = message.document
+    if not validate_extension(doc.file_name or "", SUPPORTED_PDF_EXTS):
+        await _reject_compress_upload(message, "❌ Please send a PDF file only.")
+        return
+
+    if message.media_group_id:
+        key = f"{message.chat.id}:{message.media_group_id}"
+        group = _compress_pending_groups.setdefault(key, [])
+        group.append(message)
+        old_task = _compress_group_tasks.get(key)
+        if old_task and not old_task.done():
+            old_task.cancel()
+        _compress_group_tasks[key] = asyncio.create_task(
+            _finalize_compress_media_group(key, state, db_user)
+        )
+        return
+
+    await _process_single_compress_pdf(message, state, db_user=db_user)
+
+
+@router.message(PDFStates.waiting_for_file_compress)
+async def pdf_compress_receive_invalid(message: Message):
+    await _reject_compress_upload(message, "❌ Please send a PDF file only.")
+
+
+# --------------------------------------------------------------------------
+# Compress -- Section 4/5: method selection + previews
+# --------------------------------------------------------------------------
+
+async def _show_compress_preview(query: CallbackQuery, state: FSMContext, mode: CompressionMode) -> None:
+    data = await state.get_data()
+    await state.update_data(compress_mode=mode.value)
+    await state.set_state(PDFStates.waiting_for_compress_preview)
+    await _replace_compress_message(
+        query.bot, state, query.message.chat.id,
+        _render_compress_preview_text(
+            data.get("compress_filename", "document.pdf"), data.get("compress_file_size"), mode,
+        ),
+        _compress_preview_keyboard(),
+    )
+
+
+@router.callback_query(PDFStates.waiting_for_compress_method, F.data == COMPRESS_CB_METHOD_BEST)
+async def pdf_compress_choose_best(query: CallbackQuery, state: FSMContext):
+    await query.answer()
+    await _show_compress_preview(query, state, CompressionMode.BEST_QUALITY)
+
+
+@router.callback_query(PDFStates.waiting_for_compress_method, F.data == COMPRESS_CB_METHOD_BALANCED)
+async def pdf_compress_choose_balanced(query: CallbackQuery, state: FSMContext):
+    await query.answer()
+    await _show_compress_preview(query, state, CompressionMode.BALANCED)
+
+
+@router.callback_query(PDFStates.waiting_for_compress_method, F.data == COMPRESS_CB_METHOD_MAXIMUM)
+async def pdf_compress_choose_maximum(query: CallbackQuery, state: FSMContext):
+    await query.answer()
+    await _show_compress_preview(query, state, CompressionMode.MAXIMUM)
+
+
+@router.callback_query(PDFStates.waiting_for_compress_method, F.data == COMPRESS_CB_METHOD_TARGET)
+async def pdf_compress_choose_target(query: CallbackQuery, state: FSMContext):
+    await query.answer()
+    data = await state.get_data()
+    await state.set_state(PDFStates.waiting_for_compress_target_input)
+    await _replace_compress_message(
+        query.bot, state, query.message.chat.id,
+        _render_compress_target_input_text(data.get("compress_file_size")),
+        _compress_target_input_keyboard(),
+    )
+
+
+@router.callback_query(
+    StateFilter(
+        PDFStates.waiting_for_compress_preview,
+        PDFStates.waiting_for_compress_target_input,
+        PDFStates.waiting_for_compress_target_preview,
+    ),
+    F.data == COMPRESS_CB_BACK_TO_METHOD,
+)
+@router.callback_query(PDFStates.waiting_for_compress_preview, F.data == COMPRESS_CB_CHANGE_MODE)
+async def pdf_compress_back_to_method(query: CallbackQuery, state: FSMContext):
+    await query.answer()
+    data = await state.get_data()
+    recommended = CompressionMode(data.get("compress_recommended", CompressionMode.BALANCED.value))
+    await state.set_state(PDFStates.waiting_for_compress_method)
+    # Re-render the analysis screen from cached numbers (no need to re-run
+    # PyMuPDF -- nothing about the file has changed).
+    fake_analysis = type("_A", (), {
+        "doc_type": data.get("compress_doc_type", "Digital PDF"),
+        "image_count": data.get("compress_image_count", 0),
+        "text_amount": data.get("compress_text_amount", "Medium"),
+        "recommended": recommended,
+    })
+    await _replace_compress_message(
+        query.bot, state, query.message.chat.id,
+        _render_compress_analysis_text(fake_analysis, data.get("compress_page_count", 0)),
+        _compress_method_keyboard(),
+    )
+
+
+# --------------------------------------------------------------------------
+# Compress -- Section 5D/6/7: Target File Size input, validation, preview
+# --------------------------------------------------------------------------
+
+@router.message(PDFStates.waiting_for_compress_target_input, F.text)
+async def pdf_compress_target_input(message: Message, state: FSMContext):
+    data = await state.get_data()
+    original_size = data.get("compress_file_size")
+
+    try:
+        await message.delete()
+    except Exception as e:
+        logger.debug(f"Compress: could not delete target-size input message: {e}")
+
+    try:
+        target_bytes = _parse_target_size_mb(message.text, original_size)
+    except ValueError as e:
+        await _send_temp_validation_error(message.bot, message.chat.id, f"❌ {e}")
+        return
+
+    await state.update_data(compress_target_bytes=target_bytes)
+    await state.set_state(PDFStates.waiting_for_compress_target_preview)
+    await _replace_compress_message(
+        message.bot, state, message.chat.id,
+        _render_compress_target_preview_text(original_size, target_bytes),
+        _compress_target_preview_keyboard(),
+    )
+
+
+@router.message(PDFStates.waiting_for_compress_target_input)
+async def pdf_compress_target_input_invalid(message: Message):
+    try:
+        await message.delete()
+    except Exception as e:
+        logger.debug(f"Compress: could not delete non-text target input: {e}")
+    await _send_temp_validation_error(
+        message.bot, message.chat.id, "❌ Please send the target size as text. Example: 10"
+    )
+
+
+@router.callback_query(PDFStates.waiting_for_compress_target_preview, F.data == COMPRESS_CB_CHANGE_SIZE)
+async def pdf_compress_change_size(query: CallbackQuery, state: FSMContext):
+    await query.answer()
+    data = await state.get_data()
+    await state.set_state(PDFStates.waiting_for_compress_target_input)
+    await _replace_compress_message(
+        query.bot, state, query.message.chat.id,
+        _render_compress_target_input_text(data.get("compress_file_size")),
+        _compress_target_input_keyboard(),
+    )
+
+
+# --------------------------------------------------------------------------
+# Compress -- Section 8/9/10: Processing + Completion
+# --------------------------------------------------------------------------
+
+@router.callback_query(PDFStates.waiting_for_compress_preview, F.data == COMPRESS_CB_CONFIRM)
+async def pdf_compress_confirm(query: CallbackQuery, state: FSMContext, user_repo=None, db_user=None):
+    await query.answer()
+    chat_id = query.message.chat.id
+    data = await state.get_data()
+    path = data.get("compress_input_path")
+    mode = CompressionMode(data.get("compress_mode", CompressionMode.BALANCED.value))
+    if not path:
+        await query.message.answer("Session expired, please start over.")
+        await _compress_full_cleanup(state, chat_id)
+        return
+
+    await _replace_compress_message(query.bot, state, chat_id, "⏳ Compressing PDF...\n\nPlease wait...")
+
+    limits = get_effective_limits(query.from_user.id, db_user)
+    try:
+        output_path, info = await PDFCompressor().compress(path, mode, timeout=limits.subprocess_timeout)
+    except Exception as e:
+        await _fail(query.message, state, e, [path])
+        return
+
+    await track_temp_file(state, output_path)
+    await _finish_compress(query.bot, state, chat_id, path, output_path, info, user_repo, db_user)
+
+
+@router.callback_query(PDFStates.waiting_for_compress_target_preview, F.data == COMPRESS_CB_CONFIRM_TARGET)
+async def pdf_compress_confirm_target(query: CallbackQuery, state: FSMContext, user_repo=None, db_user=None):
+    await query.answer()
+    chat_id = query.message.chat.id
+    data = await state.get_data()
+    path = data.get("compress_input_path")
+    target_bytes = data.get("compress_target_bytes")
+    if not path or not target_bytes:
+        await query.message.answer("Session expired, please start over.")
+        await _compress_full_cleanup(state, chat_id)
+        return
+
+    await _replace_compress_message(query.bot, state, chat_id, "⏳ Compressing PDF...\n\nPlease wait...")
+
+    limits = get_effective_limits(query.from_user.id, db_user)
+    try:
+        output_path, info = await PDFCompressor().compress(
+            path, CompressionMode.TARGET_SIZE, target_size_bytes=target_bytes, timeout=limits.subprocess_timeout,
+        )
+    except Exception as e:
+        await _fail(query.message, state, e, [path])
+        return
+
+    await track_temp_file(state, output_path)
+    await _finish_compress(query.bot, state, chat_id, path, output_path, info, user_repo, db_user)
+
+
+async def _finish_compress(bot, state, chat_id, input_path, output_path, info, user_repo, db_user) -> None:
+    cleanup_paths = [input_path, output_path]
+    try:
+        await bot.send_document(chat_id, FSInputFile(output_path, filename="compressed.pdf"))
+    finally:
+        delete_paths(cleanup_paths)
+        await untrack_temp_files(state, cleanup_paths)
+
+    await _track_usage(user_repo, db_user)
+    data = await state.get_data()
+    await state.clear()
+    old_chat_id = data.get("compress_status_chat_id")
+    old_message_id = data.get("compress_status_message_id")
+    if old_chat_id is not None and old_message_id is not None:
+        try:
+            await bot.delete_message(chat_id=old_chat_id, message_id=old_message_id)
+        except Exception as e:
+            logger.debug(f"Compress: could not delete processing message: {e}")
+    await bot.send_message(chat_id, _render_compress_complete_text(info))
+    logger.info(f"Compress: completed for chat {chat_id}")
+
+
+# --------------------------------------------------------------------------
+# Compress -- Section 11: Cancel (context-aware) / Section 12: /start is
+# handled generically by base.py's _reset_to_main_menu (tracked temp files
+# + FSM clear cover every Compress state the same way it covers Merge/Split).
+# --------------------------------------------------------------------------
+
+@router.callback_query(StateFilter(*_COMPRESS_STATES), F.data == COMPRESS_CB_CANCEL)
+async def pdf_compress_cancel_ask(query: CallbackQuery, state: FSMContext):
+    await query.answer()
+    chat_id = query.message.chat.id
+    current_state = await state.get_state()
+
+    if current_state == PDFStates.waiting_for_file_compress.state:
+        await _compress_full_cleanup(state, chat_id)
+        await query.message.edit_text(
+            "📄 PDF Toolkit -- choose an operation:",
+            reply_markup=get_pdf_menu(),
+        )
+        return
+
+    await state.update_data(compress_pre_cancel_state=current_state)
+    await _replace_compress_message(
+        query.bot, state, chat_id,
+        "⚠️ Cancel Compression?\n\nYour current progress will be lost.\n\nContinue?",
+        _compress_cancel_confirm_keyboard(),
+    )
+
+
+@router.callback_query(F.data == COMPRESS_CB_CANCEL_YES)
+async def pdf_compress_cancel_yes(query: CallbackQuery, state: FSMContext):
+    await query.answer()
+    chat_id = query.message.chat.id
+    await _compress_full_cleanup(state, chat_id)
+    await query.message.edit_text("❌ Compression cancelled.")
+
+
+@router.callback_query(F.data == COMPRESS_CB_CANCEL_NO)
+async def pdf_compress_cancel_no(query: CallbackQuery, state: FSMContext):
+    await query.answer()
+    data = await state.get_data()
+    prev_state = data.get("compress_pre_cancel_state")
+    await state.set_state(prev_state)
+
+    filename = data.get("compress_filename", "document.pdf")
+    size_bytes = data.get("compress_file_size")
+
+    if prev_state == PDFStates.waiting_for_compress_method.state:
+        recommended = CompressionMode(data.get("compress_recommended", CompressionMode.BALANCED.value))
+        fake_analysis = type("_A", (), {
+            "doc_type": data.get("compress_doc_type", "Digital PDF"),
+            "image_count": data.get("compress_image_count", 0),
+            "text_amount": data.get("compress_text_amount", "Medium"),
+            "recommended": recommended,
+        })
+        await _replace_compress_message(
+            query.bot, state, query.message.chat.id,
+            _render_compress_analysis_text(fake_analysis, data.get("compress_page_count", 0)),
+            _compress_method_keyboard(),
+        )
+    elif prev_state == PDFStates.waiting_for_compress_preview.state:
+        mode = CompressionMode(data.get("compress_mode", CompressionMode.BALANCED.value))
+        await _replace_compress_message(
+            query.bot, state, query.message.chat.id,
+            _render_compress_preview_text(filename, size_bytes, mode), _compress_preview_keyboard(),
+        )
+    elif prev_state == PDFStates.waiting_for_compress_target_input.state:
+        await _replace_compress_message(
+            query.bot, state, query.message.chat.id,
+            _render_compress_target_input_text(size_bytes), _compress_target_input_keyboard(),
+        )
+    elif prev_state == PDFStates.waiting_for_compress_target_preview.state:
+        target_bytes = data.get("compress_target_bytes")
+        await _replace_compress_message(
+            query.bot, state, query.message.chat.id,
+            _render_compress_target_preview_text(size_bytes, target_bytes), _compress_target_preview_keyboard(),
+        )
+
+
+# --------------------------------------------------------------------------
+# Stale-button safety net -- same rationale as Merge/Split's.
+# --------------------------------------------------------------------------
+
+_COMPRESS_ALL_CALLBACKS = {
+    COMPRESS_CB_METHOD_BEST, COMPRESS_CB_METHOD_BALANCED, COMPRESS_CB_METHOD_MAXIMUM,
+    COMPRESS_CB_METHOD_TARGET, COMPRESS_CB_BACK_TO_METHOD, COMPRESS_CB_CANCEL,
+    COMPRESS_CB_CANCEL_YES, COMPRESS_CB_CANCEL_NO, COMPRESS_CB_CONFIRM,
+    COMPRESS_CB_CHANGE_MODE, COMPRESS_CB_CONFIRM_TARGET, COMPRESS_CB_CHANGE_SIZE,
+}
+
+
+@router.callback_query(StateFilter(None), F.data.in_(_COMPRESS_ALL_CALLBACKS))
+async def pdf_compress_stale_callback(query: CallbackQuery):
+    await query.answer("This session has expired. Please start again from the menu.", show_alert=True)
+    try:
+        await query.message.edit_reply_markup(reply_markup=None)
+    except Exception as e:
+        logger.debug(f"Compress: could not strip keyboard from stale callback message: {e}")
+
+
+# --------------------------------------------------------------------------
+# Rotate (choose angle first, then upload)
+# --------------------------------------------------------------------------
+
+@router.callback_query(F.data == PDF_ROTATE)
+async def pdf_rotate_start(query: CallbackQuery, state: FSMContext):
+    await state.set_state(PDFStates.waiting_for_rotate_angle)
+    await query.message.edit_text("Choose a rotation angle:", reply_markup=rotate_angle_keyboard())
+    await query.answer()
+
+
+@router.callback_query(
+    PDFStates.waiting_for_rotate_angle,
+    F.data.in_({PDF_ROTATE_90, PDF_ROTATE_180, PDF_ROTATE_270}),
+)
+async def pdf_rotate_angle_chosen(query: CallbackQuery, state: FSMContext):
+    angle_map = {PDF_ROTATE_90: 90, PDF_ROTATE_180: 180, PDF_ROTATE_270: 270}
+    await state.update_data(rotate_angle=angle_map[query.data])
+    await state.set_state(PDFStates.waiting_for_file_rotate)
+    await query.message.edit_text("Send the PDF file to rotate.", reply_markup=back_home_cancel())
+    await query.answer()
+
+
+@router.message(PDFStates.waiting_for_file_rotate, F.document)
+async def pdf_rotate_process(message: Message, state: FSMContext, user_repo=None, db_user=None):
+    path = await _download_and_validate(message, state, SUPPORTED_PDF_EXTS, _PDF_MIME, "PDF", db_user=db_user)
+    if path is None:
+        return
+
+    data = await state.get_data()
+    angle = data.get("rotate_angle", 90)
+
+    await message.answer("Rotating... please wait.")
+    try:
+        output_path = await PDFRotator().rotate(path, angle)
+    except Exception as e:
+        await _fail(message, state, e, [path])
+        return
+
+    await track_temp_file(state, output_path)
+    await _track_usage(user_repo, db_user)
+    await _finish_with_document(message, state, output_path, "rotated.pdf", [path, output_path])
+
+
+# --------------------------------------------------------------------------
+# Extract pages
+# --------------------------------------------------------------------------
+
+@router.callback_query(F.data == PDF_EXTRACT)
+async def pdf_extract_start(query: CallbackQuery, state: FSMContext):
+    await state.set_state(PDFStates.waiting_for_file_extract)
+    await query.message.edit_text("Send the PDF file to extract pages from.", reply_markup=back_home_cancel())
+    await query.answer()
+
+
+@router.message(PDFStates.waiting_for_file_extract, F.document)
+async def pdf_extract_receive(message: Message, state: FSMContext, db_user=None):
+    path = await _download_and_validate(message, state, SUPPORTED_PDF_EXTS, _PDF_MIME, "PDF", db_user=db_user)
+    if path is None:
+        return
+    try:
+        reader = open_pdf_reader(path)
+        page_count = check_page_count(reader)
+    except PDFProcessingError as e:
+        await _fail(message, state, e, [path])
+        return
+
+    await state.update_data(extract_input_path=path, extract_page_count=page_count)
+    await state.set_state(PDFStates.waiting_for_extract_ranges)
+    await message.answer(
+        f"This PDF has {page_count} pages.\n"
+        "Send the pages to extract, e.g. 1-3,5,9",
+        reply_markup=back_home_cancel(),
+    )
+
+
+@router.message(PDFStates.waiting_for_extract_ranges, F.text)
+async def pdf_extract_process(message: Message, state: FSMContext, user_repo=None, db_user=None):
+    data = await state.get_data()
+    path = data.get("extract_input_path")
+    if not path:
+        await message.answer("Session expired, please start over.")
+        await state.clear()
+        return
+
+    await message.answer("Extracting... please wait.")
+    try:
+        output_path = await PDFExtractor().extract(path, message.text.strip())
+    except Exception as e:
+        await _fail(message, state, e, [path])
+        return
+
+    await track_temp_file(state, output_path)
+    await _track_usage(user_repo, db_user)
+    await _finish_with_document(message, state, output_path, "extracted.pdf", [path, output_path])
+
+
+# --------------------------------------------------------------------------
+# Rearrange pages
+# --------------------------------------------------------------------------
+
+@router.callback_query(F.data == PDF_REARRANGE)
+async def pdf_rearrange_start(query: CallbackQuery, state: FSMContext):
+    await state.set_state(PDFStates.waiting_for_file_rearrange)
+    await query.message.edit_text("Send the PDF file to reorder.", reply_markup=back_home_cancel())
+    await query.answer()
+
+
+@router.message(PDFStates.waiting_for_file_rearrange, F.document)
+async def pdf_rearrange_receive(message: Message, state: FSMContext, db_user=None):
+    path = await _download_and_validate(message, state, SUPPORTED_PDF_EXTS, _PDF_MIME, "PDF", db_user=db_user)
+    if path is None:
+        return
+    try:
+        reader = open_pdf_reader(path)
+        page_count = check_page_count(reader, min_pages=2)
+    except PDFProcessingError as e:
+        await _fail(message, state, e, [path])
+        return
+
+    await state.update_data(rearrange_input_path=path, rearrange_page_count=page_count)
+    await state.set_state(PDFStates.waiting_for_rearrange_order)
+    await message.answer(
+        f"This PDF has {page_count} pages.\n"
+        "Send the new page order, e.g. 3,1,2\n"
+        "Every page number from 1 to the page count must appear exactly once.",
+        reply_markup=back_home_cancel(),
+    )
+
+
+@router.message(PDFStates.waiting_for_rearrange_order, F.text)
+async def pdf_rearrange_process(message: Message, state: FSMContext, user_repo=None, db_user=None):
+    data = await state.get_data()
+    path = data.get("rearrange_input_path")
+    if not path:
+        await message.answer("Session expired, please start over.")
+        await state.clear()
+        return
+
+    await message.answer("Reordering... please wait.")
