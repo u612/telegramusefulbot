@@ -384,8 +384,9 @@ def _merge_upload_keyboard():
 def _merge_arrange_keyboard():
     b = InlineKeyboardBuilder()
     b.button(text="✅ Proceed with This Order", callback_data=MERGE_CB_PROCEED_CURRENT_ORDER)
+    b.button(text="➕ Add More", callback_data=MERGE_CB_ADD_MORE)
     b.button(text="❌ Cancel", callback_data=MERGE_CB_CANCEL)
-    b.adjust(1, 1)
+    b.adjust(1, 1, 1)
     return b.as_markup()
 
 
@@ -975,6 +976,21 @@ async def pdf_merge_arrange_proceed_current(query: CallbackQuery, state: FSMCont
     names: List[str] = list(data.get("merge_file_names", []))
     order: List[int] = list(data.get("merge_order") or range(len(names)))
     await _enter_preview_screen(query.bot, state, order)
+
+
+@router.callback_query(PDFStates.waiting_for_merge_arrange, F.data == MERGE_CB_ADD_MORE)
+async def pdf_merge_arrange_add_more(query: CallbackQuery, state: FSMContext):
+    await query.answer()
+    data = await state.get_data()
+    sizes: List[Optional[int]] = list(data.get("merge_file_sizes", []))
+    await state.update_data(merge_add_more_mode=True)
+    await state.set_state(PDFStates.waiting_for_files_merge)
+    await _edit_merge_status(
+        query.bot, state,
+        _render_queue_updated_text(len(sizes), sizes, add_more=True),
+        keyboard=_merge_upload_keyboard(),
+        force=True,
+    )
 
 
 # --------------------------------------------------------------------------
