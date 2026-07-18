@@ -8,9 +8,16 @@ class PDFStates(StatesGroup):
     waiting_for_merge_preview = State()
     waiting_for_merge_filename = State()
 
-    # Split
+    # Split (redesigned to match Merge's UX: PDF -> choose method -> input
+    # -> preview -> confirm -> process/upload)
     waiting_for_file_split = State()
-    waiting_for_split_ranges = State()
+    waiting_for_split_method = State()
+    waiting_for_split_range_input = State()
+    waiting_for_split_range_preview = State()
+    waiting_for_split_extract_input = State()
+    waiting_for_split_extract_preview = State()
+    waiting_for_split_every_preview = State()
+    waiting_for_split_large_confirm = State()
 
     # Compress
     waiting_for_compress_level = State()
