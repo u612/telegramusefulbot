@@ -29,9 +29,8 @@ from bot.keyboards.pdf import (
     PDF_MERGE, PDF_SPLIT, PDF_COMPRESS, PDF_ROTATE, PDF_EXTRACT,
     PDF_REARRANGE, PDF_WATERMARK, PDF_ADD_PASSWORD, PDF_REMOVE_PASSWORD,
     PDF_IMAGE_TO_PDF, PDF_PDF_TO_IMAGES, PDF_DONE,
-    upload_done_keyboard, compression_level_keyboard, rotate_angle_keyboard,
+    upload_done_keyboard, rotate_angle_keyboard,
     pdf_to_images_format_keyboard, merge_queue_keyboard,
-    PDF_COMPRESS_LOW, PDF_COMPRESS_MEDIUM, PDF_COMPRESS_HIGH,
     PDF_ROTATE_90, PDF_ROTATE_180, PDF_ROTATE_270,
     PDF_TO_IMG_PNG, PDF_TO_IMG_JPEG,
 )
@@ -47,7 +46,7 @@ from services.telegram import get_transport
 
 from services.pdf.merger import PDFMerger
 from services.pdf.splitter import PDFSplitter
-from services.pdf.compressor import PDFCompressor, CompressionLevel
+from services.pdf.compressor import PDFCompressor, CompressionMode
 from services.pdf.rotator import PDFRotator
 from services.pdf.extractor import PDFExtractor
 from services.pdf.rearranger import PDFRearranger
@@ -2263,197 +2262,223 @@ async def pdf_split_stale_callback(query: CallbackQuery):
 
 
 # --------------------------------------------------------------------------
-# Compress (choose level first, then upload)
+# Compress (redesigned to match Merge/Split's UX philosophy: PDF first,
+# then analyze it, then choose a mode, then preview/confirm, then compress.
+# Reuses the shared helpers above -- _download_and_validate, _fail,
+# _send_temp_validation_error, track/untrack_temp_files, etc. -- exactly
+# like Split does. Only the conversational flow and the compression engine
+# itself (services/pdf/compressor.py) are new.)
 # --------------------------------------------------------------------------
 
-@router.callback_query(F.data == PDF_COMPRESS)
-async def pdf_compress_start(query: CallbackQuery, state: FSMContext):
-    await state.set_state(PDFStates.waiting_for_compress_level)
-    await query.message.edit_text(
-        "Choose a compression level:",
-        reply_markup=compression_level_keyboard(),
-    )
-    await query.answer()
+COMPRESS_CB_METHOD_BEST = "pdfcompress:method_best"
+COMPRESS_CB_METHOD_BALANCED = "pdfcompress:method_balanced"
+COMPRESS_CB_METHOD_MAXIMUM = "pdfcompress:method_maximum"
+COMPRESS_CB_METHOD_TARGET = "pdfcompress:method_target"
+COMPRESS_CB_BACK_TO_METHOD = "pdfcompress:back_to_method"
+COMPRESS_CB_CANCEL = "pdfcompress:cancel"
+COMPRESS_CB_CANCEL_YES = "pdfcompress:cancel_yes"
+COMPRESS_CB_CANCEL_NO = "pdfcompress:cancel_no"
+COMPRESS_CB_CONFIRM = "pdfcompress:confirm"
+COMPRESS_CB_CHANGE_MODE = "pdfcompress:change_mode"
+COMPRESS_CB_CONFIRM_TARGET = "pdfcompress:confirm_target"
+COMPRESS_CB_CHANGE_SIZE = "pdfcompress:change_size"
 
-
-@router.callback_query(
-    PDFStates.waiting_for_compress_level,
-    F.data.in_({PDF_COMPRESS_LOW, PDF_COMPRESS_MEDIUM, PDF_COMPRESS_HIGH}),
+_COMPRESS_STATES = (
+    PDFStates.waiting_for_file_compress,
+    PDFStates.waiting_for_compress_method,
+    PDFStates.waiting_for_compress_preview,
+    PDFStates.waiting_for_compress_target_input,
+    PDFStates.waiting_for_compress_target_preview,
 )
-async def pdf_compress_level_chosen(query: CallbackQuery, state: FSMContext):
-    level_map = {
-        PDF_COMPRESS_LOW: CompressionLevel.LOW,
-        PDF_COMPRESS_MEDIUM: CompressionLevel.MEDIUM,
-        PDF_COMPRESS_HIGH: CompressionLevel.HIGH,
-    }
-    await state.update_data(compress_level=level_map[query.data].value)
-    await state.set_state(PDFStates.waiting_for_file_compress)
-    await query.message.edit_text(
-        "Send the PDF file to compress.",
-        reply_markup=back_home_cancel(),
-    )
-    await query.answer()
+
+_COMPRESS_MODE_LABELS = {
+    CompressionMode.BEST_QUALITY: "🟢 Best Quality",
+    CompressionMode.BALANCED: "🟡 Balanced",
+    CompressionMode.MAXIMUM: "🔴 Maximum Compression",
+}
+_COMPRESS_MODE_ICON = {
+    CompressionMode.BEST_QUALITY: "🟢",
+    CompressionMode.BALANCED: "🟡",
+    CompressionMode.MAXIMUM: "🔴",
+}
+_COMPRESS_MODE_BLURB = {
+    CompressionMode.BEST_QUALITY: "This preserves the highest possible quality while reducing file size.",
+    CompressionMode.BALANCED: "Provides a good balance between quality and file size.",
+    CompressionMode.MAXIMUM: "Produces the smallest possible file.",
+}
+
+# Media-group buffering for the "one PDF only" rule -- identical rationale
+# to Split's (see _split_pending_groups above): an album needs to be
+# rejected as a whole, not silently reduced to its first file.
+_compress_pending_groups: Dict[str, List[Message]] = {}
+_compress_group_tasks: Dict[str, asyncio.Task] = {}
 
 
-@router.message(PDFStates.waiting_for_file_compress, F.document)
-async def pdf_compress_process(message: Message, state: FSMContext, user_repo=None, db_user=None):
-    path = await _download_and_validate(message, state, SUPPORTED_PDF_EXTS, _PDF_MIME, "PDF", db_user=db_user)
-    if path is None:
-        return
-
-    data = await state.get_data()
-    level = CompressionLevel(data.get("compress_level", CompressionLevel.MEDIUM.value))
-    limits = get_effective_limits(message.from_user.id, db_user)
-
-    await message.answer("Compressing... please wait.")
-    try:
-        output_path = await PDFCompressor().compress(path, level, timeout=limits.subprocess_timeout)
-    except Exception as e:
-        await _fail(message, state, e, [path])
-        return
-
-    await track_temp_file(state, output_path)
-    await _track_usage(user_repo, db_user)
-    await _finish_with_document(message, state, output_path, "compressed.pdf", [path, output_path])
+def _compress_upload_keyboard():
+    b = InlineKeyboardBuilder()
+    b.button(text="❌ Cancel", callback_data=COMPRESS_CB_CANCEL)
+    b.adjust(1)
+    return b.as_markup()
 
 
-# --------------------------------------------------------------------------
-# Rotate (choose angle first, then upload)
-# --------------------------------------------------------------------------
-
-@router.callback_query(F.data == PDF_ROTATE)
-async def pdf_rotate_start(query: CallbackQuery, state: FSMContext):
-    await state.set_state(PDFStates.waiting_for_rotate_angle)
-    await query.message.edit_text("Choose a rotation angle:", reply_markup=rotate_angle_keyboard())
-    await query.answer()
-
-
-@router.callback_query(
-    PDFStates.waiting_for_rotate_angle,
-    F.data.in_({PDF_ROTATE_90, PDF_ROTATE_180, PDF_ROTATE_270}),
-)
-async def pdf_rotate_angle_chosen(query: CallbackQuery, state: FSMContext):
-    angle_map = {PDF_ROTATE_90: 90, PDF_ROTATE_180: 180, PDF_ROTATE_270: 270}
-    await state.update_data(rotate_angle=angle_map[query.data])
-    await state.set_state(PDFStates.waiting_for_file_rotate)
-    await query.message.edit_text("Send the PDF file to rotate.", reply_markup=back_home_cancel())
-    await query.answer()
+def _compress_method_keyboard():
+    b = InlineKeyboardBuilder()
+    b.button(text="🟢 Best Quality", callback_data=COMPRESS_CB_METHOD_BEST)
+    b.button(text="🟡 Balanced", callback_data=COMPRESS_CB_METHOD_BALANCED)
+    b.button(text="🔴 Maximum Compression", callback_data=COMPRESS_CB_METHOD_MAXIMUM)
+    b.button(text="🎯 Target File Size", callback_data=COMPRESS_CB_METHOD_TARGET)
+    b.button(text="❌ Cancel", callback_data=COMPRESS_CB_CANCEL)
+    b.adjust(1, 1, 1, 1, 1)
+    return b.as_markup()
 
 
-@router.message(PDFStates.waiting_for_file_rotate, F.document)
-async def pdf_rotate_process(message: Message, state: FSMContext, user_repo=None, db_user=None):
-    path = await _download_and_validate(message, state, SUPPORTED_PDF_EXTS, _PDF_MIME, "PDF", db_user=db_user)
-    if path is None:
-        return
-
-    data = await state.get_data()
-    angle = data.get("rotate_angle", 90)
-
-    await message.answer("Rotating... please wait.")
-    try:
-        output_path = await PDFRotator().rotate(path, angle)
-    except Exception as e:
-        await _fail(message, state, e, [path])
-        return
-
-    await track_temp_file(state, output_path)
-    await _track_usage(user_repo, db_user)
-    await _finish_with_document(message, state, output_path, "rotated.pdf", [path, output_path])
+def _compress_preview_keyboard():
+    b = InlineKeyboardBuilder()
+    b.button(text="✅ Compress", callback_data=COMPRESS_CB_CONFIRM)
+    b.button(text="🔄 Change Mode", callback_data=COMPRESS_CB_CHANGE_MODE)
+    b.button(text="❌ Cancel", callback_data=COMPRESS_CB_CANCEL)
+    b.adjust(1, 1, 1)
+    return b.as_markup()
 
 
-# --------------------------------------------------------------------------
-# Extract pages
-# --------------------------------------------------------------------------
-
-@router.callback_query(F.data == PDF_EXTRACT)
-async def pdf_extract_start(query: CallbackQuery, state: FSMContext):
-    await state.set_state(PDFStates.waiting_for_file_extract)
-    await query.message.edit_text("Send the PDF file to extract pages from.", reply_markup=back_home_cancel())
-    await query.answer()
+def _compress_target_input_keyboard():
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ Back", callback_data=COMPRESS_CB_BACK_TO_METHOD)
+    b.button(text="❌ Cancel", callback_data=COMPRESS_CB_CANCEL)
+    b.adjust(2)
+    return b.as_markup()
 
 
-@router.message(PDFStates.waiting_for_file_extract, F.document)
-async def pdf_extract_receive(message: Message, state: FSMContext, db_user=None):
-    path = await _download_and_validate(message, state, SUPPORTED_PDF_EXTS, _PDF_MIME, "PDF", db_user=db_user)
-    if path is None:
-        return
-    try:
-        reader = open_pdf_reader(path)
-        page_count = check_page_count(reader)
-    except PDFProcessingError as e:
-        await _fail(message, state, e, [path])
-        return
+def _compress_target_preview_keyboard():
+    b = InlineKeyboardBuilder()
+    b.button(text="✅ Compress", callback_data=COMPRESS_CB_CONFIRM_TARGET)
+    b.button(text="🔄 Change Size", callback_data=COMPRESS_CB_CHANGE_SIZE)
+    b.button(text="❌ Cancel", callback_data=COMPRESS_CB_CANCEL)
+    b.adjust(1, 1, 1)
+    return b.as_markup()
 
-    await state.update_data(extract_input_path=path, extract_page_count=page_count)
-    await state.set_state(PDFStates.waiting_for_extract_ranges)
-    await message.answer(
-        f"This PDF has {page_count} pages.\n"
-        "Send the pages to extract, e.g. 1-3,5,9",
-        reply_markup=back_home_cancel(),
+
+def _compress_cancel_confirm_keyboard():
+    b = InlineKeyboardBuilder()
+    b.button(text="✅ Yes, Cancel", callback_data=COMPRESS_CB_CANCEL_YES)
+    b.button(text="❎ Continue", callback_data=COMPRESS_CB_CANCEL_NO)
+    b.adjust(2)
+    return b.as_markup()
+
+
+def _render_compress_loaded_text(filename: str, page_count: int, size_bytes: Optional[int]) -> str:
+    return (
+        f"{_QUEUE_DIVIDER}\n"
+        "📄 PDF Loaded\n\n"
+        f"Filename\n{_display_name(filename)}\n\n"
+        f"Pages\n{page_count}\n\n"
+        f"Current Size\n{_format_size(size_bytes)}\n\n"
+        "Analyzing PDF...\n"
+        f"{_QUEUE_DIVIDER}"
     )
 
 
-@router.message(PDFStates.waiting_for_extract_ranges, F.text)
-async def pdf_extract_process(message: Message, state: FSMContext, user_repo=None, db_user=None):
-    data = await state.get_data()
-    path = data.get("extract_input_path")
-    if not path:
-        await message.answer("Session expired, please start over.")
-        await state.clear()
-        return
-
-    await message.answer("Extracting... please wait.")
-    try:
-        output_path = await PDFExtractor().extract(path, message.text.strip())
-    except Exception as e:
-        await _fail(message, state, e, [path])
-        return
-
-    await track_temp_file(state, output_path)
-    await _track_usage(user_repo, db_user)
-    await _finish_with_document(message, state, output_path, "extracted.pdf", [path, output_path])
-
-
-# --------------------------------------------------------------------------
-# Rearrange pages
-# --------------------------------------------------------------------------
-
-@router.callback_query(F.data == PDF_REARRANGE)
-async def pdf_rearrange_start(query: CallbackQuery, state: FSMContext):
-    await state.set_state(PDFStates.waiting_for_file_rearrange)
-    await query.message.edit_text("Send the PDF file to reorder.", reply_markup=back_home_cancel())
-    await query.answer()
-
-
-@router.message(PDFStates.waiting_for_file_rearrange, F.document)
-async def pdf_rearrange_receive(message: Message, state: FSMContext, db_user=None):
-    path = await _download_and_validate(message, state, SUPPORTED_PDF_EXTS, _PDF_MIME, "PDF", db_user=db_user)
-    if path is None:
-        return
-    try:
-        reader = open_pdf_reader(path)
-        page_count = check_page_count(reader, min_pages=2)
-    except PDFProcessingError as e:
-        await _fail(message, state, e, [path])
-        return
-
-    await state.update_data(rearrange_input_path=path, rearrange_page_count=page_count)
-    await state.set_state(PDFStates.waiting_for_rearrange_order)
-    await message.answer(
-        f"This PDF has {page_count} pages.\n"
-        "Send the new page order, e.g. 3,1,2\n"
-        "Every page number from 1 to the page count must appear exactly once.",
-        reply_markup=back_home_cancel(),
+def _render_compress_analysis_text(analysis, page_count: int) -> str:
+    return (
+        f"{_QUEUE_DIVIDER}\n"
+        "📊 PDF Analysis\n\n"
+        f"Type\n{analysis.doc_type}\n\n"
+        f"Pages\n{page_count}\n\n"
+        f"Images\n{analysis.image_count}\n\n"
+        f"Text\n{analysis.text_amount}\n\n"
+        f"Recommended\n{_COMPRESS_MODE_LABELS[analysis.recommended]}\n\n"
+        "Choose a compression method.\n"
+        f"{_QUEUE_DIVIDER}"
     )
 
 
-@router.message(PDFStates.waiting_for_rearrange_order, F.text)
-async def pdf_rearrange_process(message: Message, state: FSMContext, user_repo=None, db_user=None):
-    data = await state.get_data()
-    path = data.get("rearrange_input_path")
-    if not path:
-        await message.answer("Session expired, please start over.")
-        await state.clear()
-        return
+def _render_compress_preview_text(filename: str, size_bytes: Optional[int], mode: CompressionMode) -> str:
+    icon = _COMPRESS_MODE_ICON[mode]
+    label = _COMPRESS_MODE_LABELS[mode].split(" ", 1)[1]
+    return (
+        f"{_QUEUE_DIVIDER}\n"
+        f"{icon} Compression Preview\n\n"
+        f"Document\n{_display_name(filename)}\n\n"
+        f"Current Size\n{_format_size(size_bytes)}\n\n"
+        f"Mode\n{label}\n\n"
+        f"{_COMPRESS_MODE_BLURB[mode]}\n\n"
+        "Continue?\n"
+        f"{_QUEUE_DIVIDER}"
+    )
 
-    await message.answer("Reordering... please wait.")
+
+def _render_compress_target_input_text(size_bytes: Optional[int]) -> str:
+    return (
+        f"{_QUEUE_DIVIDER}\n"
+        "🎯 Target File Size\n\n"
+        f"Current Size\n{_format_size(size_bytes)}\n\n"
+        "Enter your desired file size.\n\n"
+        "Examples\n"
+        "20\n"
+        "15.5\n"
+        "10\n\n"
+        "(Unit: MB)\n"
+        f"{_QUEUE_DIVIDER}"
+    )
+
+
+def _render_compress_target_preview_text(original_size: Optional[int], target_bytes: int) -> str:
+    return (
+        f"{_QUEUE_DIVIDER}\n"
+        "🎯 Compression Preview\n\n"
+        f"Original Size\n{_format_size(original_size)}\n\n"
+        f"Target Size\n{_format_size(target_bytes)}\n\n"
+        "The PDF will be compressed as close as possible to the requested "
+        "size while maintaining the best possible quality.\n\n"
+        "Continue?\n"
+        f"{_QUEUE_DIVIDER}"
+    )
+
+
+def _render_compress_complete_text(info: dict) -> str:
+    original = info["original_size"]
+    compressed = info["compressed_size"]
+    saved = max(original - compressed, 0)
+    pct = (saved / original * 100) if original else 0
+
+    if saved <= 0 or pct < 1:
+        lines = [
+            _QUEUE_DIVIDER,
+            "ℹ️ Compression Complete",
+            "",
+            "This PDF is already well optimized.",
+            "No significant size reduction was possible.",
+        ]
+    else:
+        lines = [
+            _QUEUE_DIVIDER,
+            "✅ Compression Complete",
+            "",
+            f"Original Size\n{_format_size(original)}",
+            "",
+            f"Compressed Size\n{_format_size(compressed)}",
+            "",
+            f"Space Saved\n{_format_size(saved)} ({pct:.0f}%)",
+        ]
+
+    if "target_size" in info:
+        lines += [
+            "",
+            f"Target Size\n{_format_size(info['target_size'])}",
+            "",
+            f"Final Size\n{_format_size(compressed)}",
+        ]
+        if not info.get("target_achieved", True):
+            lines += ["", "The exact target couldn't be reached -- this is the closest achievable size."]
+
+    lines.append(_QUEUE_DIVIDER)
+    return "\n".join(lines)
+
+
+def _parse_target_size_mb(text: str, original_size: Optional[int]) -> int:
+    """Validates a user-entered target size in MB. Raises ValueError with a
+    user-facing message; returns the target size in bytes."""
+    try:
+        value = float(text.strip())
+    except ValueError:
+  
