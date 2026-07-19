@@ -604,7 +604,10 @@ async def pdf_compress_confirm(query: CallbackQuery, state: FSMContext, user_rep
         return
 
     await track_temp_file(state, output_path)
-    await _finish_compress(query.bot, state, chat_id, path, output_path, info, user_repo, db_user)
+    await _finish_compress(
+        query.bot, state, chat_id, path, output_path, info, user_repo, db_user,
+        data.get("compress_filename", "document.pdf"),
+    )
 
 
 @router.callback_query(PDFStates.waiting_for_compress_target_preview, F.data == COMPRESS_CB_CONFIRM_TARGET)
@@ -631,13 +634,27 @@ async def pdf_compress_confirm_target(query: CallbackQuery, state: FSMContext, u
         return
 
     await track_temp_file(state, output_path)
-    await _finish_compress(query.bot, state, chat_id, path, output_path, info, user_repo, db_user)
+    await _finish_compress(
+        query.bot, state, chat_id, path, output_path, info, user_repo, db_user,
+        data.get("compress_filename", "document.pdf"),
+    )
 
 
-async def _finish_compress(bot, state, chat_id, input_path, output_path, info, user_repo, db_user) -> None:
+def _cmp_filename(original_filename: str) -> str:
+    """physics.pdf -> physics_cmp.pdf, report_final.pdf -> report_final_cmp.pdf.
+    Always preserves the original stem -- never a generic name.
+    """
+    name = original_filename or "document.pdf"
+    stem, dot, ext = name.rpartition(".")
+    if not dot:
+        return f"{name}_cmp.pdf"
+    return f"{stem}_cmp.{ext}" if ext.lower() == "pdf" else f"{name}_cmp.pdf"
+
+
+async def _finish_compress(bot, state, chat_id, input_path, output_path, info, user_repo, db_user, filename="document.pdf") -> None:
     cleanup_paths = [input_path, output_path]
     try:
-        await bot.send_document(chat_id, FSInputFile(output_path, filename="compressed.pdf"))
+        await bot.send_document(chat_id, FSInputFile(output_path, filename=_cmp_filename(filename)))
     finally:
         delete_paths(cleanup_paths)
         await untrack_temp_files(state, cleanup_paths)
@@ -753,5 +770,3 @@ async def pdf_compress_stale_callback(query: CallbackQuery):
         await query.message.edit_reply_markup(reply_markup=None)
     except Exception as e:
         logger.debug(f"Compress: could not strip keyboard from stale callback message: {e}")
-
-
