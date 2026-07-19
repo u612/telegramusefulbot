@@ -196,6 +196,25 @@ def _render_pdf_loaded_text(filename: str, page_count: int, size_bytes: Optional
     )
 
 
+def _render_pdf_loaded_and_pages_text(filename: str, page_count: int, size_bytes: Optional[int]) -> str:
+    """Combined 'PDF Loaded' + pages-prompt screen shown immediately after
+    upload -- avoids the delete-and-resend flicker of showing '✅ PDF
+    Loaded' and then instantly replacing it with the pages prompt.
+    """
+    return (
+        f"{_QUEUE_DIVIDER}\n"
+        "✅ PDF Loaded\n"
+        f"📄 {_display_name(filename)}\n"
+        f"{page_count} Pages • {_format_size(size_bytes)}\n\n"
+        "Extract pages:\n"
+        "5\n"
+        "5,8\n"
+        "3-15\n"
+        "2,5,8-12,20\n"
+        f"{_QUEUE_DIVIDER}"
+    )
+
+
 def _render_pages_input_text() -> str:
     return (
         f"{_QUEUE_DIVIDER}\n"
@@ -344,16 +363,10 @@ async def _process_single_extract_pdf(message: Message, state: FSMContext, db_us
         extract_file_size=size_bytes,
     )
     await state.set_state(ExtractStates.waiting_for_extract_pages_input)
-    sent = await message.answer(
-        _render_pdf_loaded_text(filename, page_count, size_bytes),
-    )
-    await state.update_data(extract_status_chat_id=message.chat.id, extract_status_message_id=sent.message_id)
-
-    # Immediately follow with the pages-input prompt (own message + own
-    # state), same two-message pattern Rotate uses for target -> next step.
     await _replace_extract_message(
         message.bot, state, message.chat.id,
-        _render_pages_input_text(), _extract_pages_input_keyboard(),
+        _render_pdf_loaded_and_pages_text(filename, page_count, size_bytes),
+        _extract_pages_input_keyboard(),
     )
 
 
