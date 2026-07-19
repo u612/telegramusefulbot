@@ -12,6 +12,8 @@ the order they were queued, against the arrangement as it stands at that
 point in the sequence -- nothing is merged, optimized, or reordered.
 """
 import asyncio
+import hashlib
+import os
 from typing import Dict, List, Optional, Tuple
 
 from aiogram import Router, F
@@ -493,6 +495,16 @@ def _validate_destination_page_for_move_range(dest_page: int, start: int, end: i
 # --------------------------------------------------------------------------
 # Applying the queued operations
 # --------------------------------------------------------------------------
+
+def _sha256_file(path: str) -> str:
+    """Diagnostic helper: SHA-256 of a file's bytes on disk, chunked so
+    large PDFs don't get read into memory in one go."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
 
 def _move_original_ids(order: List[int], original_ids: List[int], dest: str, dest_page: Optional[int]) -> List[int]:
     """Move the given ORIGINAL page ids (0-indexed, identifying pages by
@@ -1195,11 +1207,35 @@ async def pdf_rearrange_apply(query: CallbackQuery, state: FSMContext, user_repo
     await track_temp_file(state, output_path)
     await _track_usage(user_repo, db_user)
 
+    # --- DIAGNOSTIC INSTRUMENTATION (temporary) ---------------------------
+    # Logged immediately before send_document so we can prove, from the
+    # server side, exactly what bytes were produced for this apply -- before
+    # attributing any "looks unchanged" report to Telegram or a PDF viewer.
+    try:
+        input_sha256 = _sha256_file(path)
+        output_sha256 = _sha256_file(output_path)
+        output_size = os.path.getsize(output_path)
+        final_order = _apply_operations(
+            len(open_pdf_reader(path).pages), queue
+        )
+        logger.info(
+            "Rearrange DIAGNOSTIC: "
+            f"input_sha256={input_sha256} "
+            f"output_sha256={output_sha256} "
+            f"output_size={output_size} "
+            f"final_page_order(1-indexed)={[i + 1 for i in final_order]} "
+            f"fsinputfile_filename={filename!r}"
+        )
+    except Exception:
+        logger.exception("Rearrange DIAGNOSTIC: failed to compute instrumentation (non-fatal).")
+    # --- END DIAGNOSTIC INSTRUMENTATION ------------------------------------
+
     cleanup_paths = [path, output_path]
     try:
+        output_filename = f"_{filename}"
         await query.bot.send_document(
             chat_id,
-            FSInputFile(output_path, filename=filename),
+            FSInputFile(output_path, filename=output_filename),
             caption=_render_completion_caption(filename, len(queue)),
         )
     finally:
