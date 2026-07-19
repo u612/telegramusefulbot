@@ -494,39 +494,61 @@ def _validate_destination_page_for_move_range(dest_page: int, start: int, end: i
 # Applying the queued operations
 # --------------------------------------------------------------------------
 
-def _move_slice(order: List[int], s_idx: int, e_idx: int, dest: str, dest_page: Optional[int]) -> List[int]:
-    items = order[s_idx:e_idx + 1]
-    del order[s_idx:e_idx + 1]
-    n = len(items)
+def _move_original_ids(order: List[int], original_ids: List[int], dest: str, dest_page: Optional[int]) -> List[int]:
+    """Move the given ORIGINAL page ids (0-indexed, identifying pages by
+    their identity in the source PDF -- never by a position) out of
+    wherever they currently sit in `order` (the working order produced by
+    every previously applied operation) and reinsert them as a contiguous
+    block at the position implied by `dest`/`dest_page`.
+
+    Both the source pages and the destination page are located by
+    searching the CURRENT working order for their original id -- never by
+    assuming `id == position`. This is what makes every operation after
+    the first correctly reflect all prior queued operations instead of
+    the original upload order.
+    """
+    id_set = set(original_ids)
+    remaining = [pid for pid in order if pid not in id_set]
+    block = list(original_ids)  # preserve the block's own intended relative order
+
     if dest == "start":
         insert_at = 0
     elif dest == "end":
-        insert_at = len(order)
+        insert_at = len(remaining)
     else:
-        d_idx = dest_page - 1
-        if d_idx > e_idx:
-            d_idx -= n
-        elif d_idx >= s_idx:
-            d_idx = s_idx
-        insert_at = d_idx if dest == "before" else d_idx + 1
-        insert_at = max(0, min(insert_at, len(order)))
-    order[insert_at:insert_at] = items
-    return order
+        dest_id = dest_page - 1
+        # dest_id is guaranteed (by queue-time validation) not to be part
+        # of the moved block, so it must still be present in `remaining`
+        # -- look up its CURRENT position there, not its original one.
+        dest_pos = remaining.index(dest_id)
+        insert_at = dest_pos if dest == "before" else dest_pos + 1
+
+    remaining[insert_at:insert_at] = block
+    return remaining
 
 
 def _apply_operations(total_pages: int, queue: List[dict]) -> List[int]:
-    order = list(range(total_pages))
+    """Replay the queued operations in order, each one acting on the
+    Working Order left behind by every operation before it. `order` is
+    the Working Order: a list of ORIGINAL 0-indexed page ids, where the
+    id's position in the list is its current position in the document.
+    Original Page IDs never change and are only used at the end to pull
+    the right pages out of the source PDF.
+    """
+    order = list(range(total_pages))  # Working Order, seeded from Original Page IDs
     for op in queue:
         t = op["type"]
         if t == "reverse":
             order.reverse()
         elif t == "swap":
-            ia, ib = op["a"] - 1, op["b"] - 1
-            order[ia], order[ib] = order[ib], order[ia]
+            pos_a = order.index(op["a"] - 1)
+            pos_b = order.index(op["b"] - 1)
+            order[pos_a], order[pos_b] = order[pos_b], order[pos_a]
         elif t == "move_page":
-            order = _move_slice(order, op["page"] - 1, op["page"] - 1, op["dest"], op.get("dest_page"))
+            order = _move_original_ids(order, [op["page"] - 1], op["dest"], op.get("dest_page"))
         elif t == "move_range":
-            order = _move_slice(order, op["start"] - 1, op["end"] - 1, op["dest"], op.get("dest_page"))
+            original_ids = list(range(op["start"] - 1, op["end"]))
+            order = _move_original_ids(order, original_ids, op["dest"], op.get("dest_page"))
     return order
 
 
