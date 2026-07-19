@@ -496,20 +496,25 @@ def _validate_destination_page_for_move_range(dest_page: int, start: int, end: i
 
 def _move_original_ids(order: List[int], original_ids: List[int], dest: str, dest_page: Optional[int]) -> List[int]:
     """Move the given ORIGINAL page ids (0-indexed, identifying pages by
-    their identity in the source PDF -- never by a position) out of
-    wherever they currently sit in `order` (the working order produced by
-    every previously applied operation) and reinsert them as a contiguous
-    block at the position implied by `dest`/`dest_page`.
+    their permanent identity in the source PDF -- never by a position)
+    out of wherever they currently sit in `order` (the Working Order
+    produced by every previously applied operation) and reinsert them as
+    a contiguous block at the position implied by `dest`/`dest_page`.
 
-    Both the source pages and the destination page are located by
-    searching the CURRENT working order for their original id -- never by
-    assuming `id == position`. This is what makes every operation after
-    the first correctly reflect all prior queued operations instead of
-    the original upload order.
+    Both the moved pages and the destination page are located by
+    searching the CURRENT Working Order for their original id -- never by
+    assuming `id == position` and never assuming the requested ids are
+    still adjacent to each other or contiguous.
+
+    The block's internal order is taken from its CURRENT relative order
+    in `order` (not from the caller's `original_ids` order), so a Move
+    Range whose pages were reshuffled among themselves by an earlier
+    Swap/Move still comes out in the order they actually appear in right
+    now instead of silently reverting to ascending original numbering.
     """
     id_set = set(original_ids)
     remaining = [pid for pid in order if pid not in id_set]
-    block = list(original_ids)  # preserve the block's own intended relative order
+    block = [pid for pid in order if pid in id_set]  # current relative order, not caller order
 
     if dest == "start":
         insert_at = 0
@@ -529,11 +534,15 @@ def _move_original_ids(order: List[int], original_ids: List[int], dest: str, des
 
 def _apply_operations(total_pages: int, queue: List[dict]) -> List[int]:
     """Replay the queued operations in order, each one acting on the
-    Working Order left behind by every operation before it. `order` is
-    the Working Order: a list of ORIGINAL 0-indexed page ids, where the
-    id's position in the list is its current position in the document.
-    Original Page IDs never change and are only used at the end to pull
-    the right pages out of the source PDF.
+    Working Order left behind by every operation before it.
+
+    `order` is the Working Order: a list of ORIGINAL 0-indexed page ids,
+    where the id's *position* in the list is its current position in the
+    document. Original Page IDs never change and are only used at the
+    very end to pull the right pages out of the source PDF -- every
+    operation below locates pages by searching `order` for their id, and
+    never assumes an id still sits at its original position or that a
+    requested set of ids is still contiguous.
     """
     order = list(range(total_pages))  # Working Order, seeded from Original Page IDs
     for op in queue:
