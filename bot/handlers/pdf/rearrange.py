@@ -27,7 +27,7 @@ from bot.keyboards.pdf import get_pdf_menu, PDF_REARRANGE
 from core.constants import SUPPORTED_PDF_EXTS, MERGE_BATCH_FINALIZE_DELAY_SECONDS
 from core.logger import logger
 
-from pypdf import PdfWriter
+import fitz  # PyMuPDF -- used only for the final rearranged-PDF write (see _rearrange_sync)
 
 from services.pdf._common import PDFProcessingError, open_pdf_reader, check_page_count
 
@@ -578,18 +578,23 @@ def _rearrange_sync(input_path: str, queue: List[dict]) -> str:
     total_pages = check_page_count(reader, min_pages=2)
     order = _apply_operations(total_pages, queue)
 
-    writer = PdfWriter()
+    # Rebuilt with PyMuPDF: doc is a brand-new Document opened fresh from
+    # input_path on every call, and select() reorders its own page tree
+    # in place -- there's no reader/writer object graph shared with any
+    # previous apply on this (or any other) file, unlike pypdf's
+    # PdfWriter.add_page(), which clones the page dict but leaves large
+    # attached objects (image XObjects, resources -- exactly what scanned
+    # PDFs are made of) as indirect references back into the source
+    # reader's object table.
+    doc = fitz.open(input_path)
     try:
-        for idx in order:
-            writer.add_page(reader.pages[idx])
-
+        doc.select(order)
         output_path = new_temp_path(suffix=".pdf")
-        with open(output_path, "wb") as f:
-            writer.write(f)
+        doc.save(output_path)
         logger.info(f"Rearranged {input_path} with {len(queue)} queued change(s) -> {output_path}")
         return output_path
     finally:
-        writer.close()
+        doc.close()
 
 
 async def _rearrange_apply(input_path: str, queue: List[dict]) -> str:
