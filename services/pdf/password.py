@@ -72,6 +72,22 @@ class PDFPassword:
         password = _validate_password_value(password)
         return await asyncio.to_thread(self._remove_password_sync, input_path, password)
 
+    async def verify_password(self, input_path: str, password: str) -> bool:
+        """Check whether `password` unlocks the (already known to be
+        encrypted) PDF at `input_path`, without writing anything out.
+        Raises PDFProcessingError if the file can't be read at all.
+        """
+        password = _validate_password_value(password)
+        return await asyncio.to_thread(self._verify_password_sync, input_path, password)
+
+    async def change_password(self, input_path: str, old_password: str, new_password: str) -> str:
+        """Replace `old_password` with `new_password` on `input_path`."""
+        old_password = _validate_password_value(old_password)
+        new_password = _validate_password_value(new_password)
+        return await asyncio.to_thread(
+            self._change_password_sync, input_path, old_password, new_password
+        )
+
     @staticmethod
     def _add_password_sync(
         input_path: str,
@@ -136,6 +152,61 @@ class PDFPassword:
             with open(output_path, "wb") as f:
                 writer.write(f)
             logger.info(f"Removed password protection from {input_path} -> {output_path}")
+            return output_path
+        finally:
+            writer.close()
+
+    @staticmethod
+    def _verify_password_sync(input_path: str, password: str) -> bool:
+        try:
+            reader = PdfReader(input_path)
+        except Exception as e:
+            logger.exception(f"Could not read PDF for password verification: {e}")
+            raise PDFProcessingError("Invalid or corrupted PDF.") from e
+
+        if not reader.is_encrypted:
+            raise PDFProcessingError("This PDF isn't password-protected.")
+
+        try:
+            result = reader.decrypt(password)
+        except Exception as e:
+            logger.debug(f"Password verification failed to decrypt: {e}")
+            return False
+
+        return bool(result)
+
+    @staticmethod
+    def _change_password_sync(input_path: str, old_password: str, new_password: str) -> str:
+        try:
+            reader = PdfReader(input_path)
+        except Exception as e:
+            logger.exception(f"Could not read PDF for password change: {e}")
+            raise PDFProcessingError("Invalid or corrupted PDF.") from e
+
+        if not reader.is_encrypted:
+            raise PDFProcessingError("This PDF isn't password-protected.")
+
+        try:
+            result = reader.decrypt(old_password)
+        except Exception as e:
+            raise PDFProcessingError(f"Failed to decrypt PDF: {e}")
+
+        if not result:
+            raise PDFProcessingError("Incorrect password.")
+
+        writer = PdfWriter()
+        try:
+            writer.append(reader)
+            if reader.metadata:
+                try:
+                    writer.add_metadata(reader.metadata)
+                except Exception as e:
+                    logger.debug(f"Change Password: could not preserve metadata: {e}")
+            writer.encrypt(new_password)
+            output_path = new_temp_path(suffix=".pdf")
+            with open(output_path, "wb") as f:
+                writer.write(f)
+            logger.info(f"Changed password protection on {input_path} -> {output_path}")
             return output_path
         finally:
             writer.close()
