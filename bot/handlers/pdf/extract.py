@@ -29,6 +29,7 @@ from services.pdf._common import PDFProcessingError, open_pdf_reader, check_page
 from utils.tempfiles import track_temp_file, untrack_temp_files, delete_paths, get_tracked_files, new_temp_path
 from utils.validators import validate_extension
 
+from utils.session_manager import register_stale_callbacks
 from .common import (
     _PDF_MIME,
     _QUEUE_DIVIDER,
@@ -610,15 +611,6 @@ async def pdf_extract_cancel_no(query: CallbackQuery, state: FSMContext):
 # no reply when pressed.
 # --------------------------------------------------------------------------
 
-_EXTRACT_ALL_CALLBACKS = {
+register_stale_callbacks(exact={
     EXTRACT_CB_BACK, EXTRACT_CB_CANCEL, EXTRACT_CB_CANCEL_YES, EXTRACT_CB_CANCEL_NO, EXTRACT_CB_CONFIRM,
-}
-
-
-@router.callback_query(StateFilter(None), F.data.in_(_EXTRACT_ALL_CALLBACKS))
-async def pdf_extract_stale_callback(query: CallbackQuery):
-    await query.answer("This session has expired. Please start again from the menu.", show_alert=True)
-    try:
-        await query.message.edit_reply_markup(reply_markup=None)
-    except Exception as e:
-        logger.debug(f"Extract: could not strip keyboard from stale callback message: {e}")
+})
