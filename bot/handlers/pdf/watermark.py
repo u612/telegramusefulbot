@@ -552,7 +552,12 @@ async def _process_single_wm_pdf(message: Message, state: FSMContext, db_user=No
 
     await state.update_data(wm_input_path=path, wm_filename=doc.file_name or "document.pdf")
     await state.set_state(WatermarkStates.waiting_for_type)
-    await _show(message.bot, state, message.chat.id, _render_type_text(), _type_keyboard())
+    # Send as a NEW message rather than editing the original upload prompt --
+    # matches Rotate/Split/Compress/etc: the upload prompt stays as-is, and
+    # this new message (appearing below the user's PDF) becomes the single
+    # message the rest of the flow edits in place.
+    sent = await message.answer(_render_type_text(), reply_markup=_type_keyboard())
+    await state.update_data(wm_prompt_message_id=sent.message_id)
 
 
 async def _finalize_wm_media_group(key: str, state: FSMContext, db_user) -> None:
