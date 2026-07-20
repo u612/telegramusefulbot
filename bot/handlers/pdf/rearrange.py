@@ -34,6 +34,7 @@ from services.pdf._common import PDFProcessingError, open_pdf_reader, check_page
 from utils.tempfiles import track_temp_file, untrack_temp_files, delete_paths, get_tracked_files, new_temp_path
 from utils.validators import validate_extension
 
+from utils.session_manager import register_stale_callbacks
 from .common import (
     _PDF_MIME,
     _QUEUE_DIVIDER,
@@ -1349,13 +1350,4 @@ _REARR_ALL_CALLBACK_PREFIXES = (
 )
 
 
-@router.callback_query(
-    StateFilter(None),
-    F.data.startswith("pdfrearr:"),
-)
-async def pdf_rearrange_stale_callback(query: CallbackQuery):
-    await query.answer("This session has expired. Please start again from the menu.", show_alert=True)
-    try:
-        await query.message.edit_reply_markup(reply_markup=None)
-    except Exception as e:
-        logger.debug(f"Rearrange: could not strip keyboard from stale callback message: {e}")
+register_stale_callbacks(prefix="pdfrearr:")
