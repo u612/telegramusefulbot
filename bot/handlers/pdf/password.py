@@ -304,8 +304,8 @@ def _render_summary_text(data: dict) -> str:
         bool(data.get("pwd_restrict")), data.get("pwd_permissions")
     )
     return (
-        "\U0001F512 Add Password\n"
-        "\u2501" * 14 + "\n\n"
+        "\U0001F512 Add Password\n\n"
+        + "\u2501" * 14 + "\n\n"
         "\U0001F4C4 File\n"
         f"{filename}\n\n"
         "\U0001F511 Password\n"
