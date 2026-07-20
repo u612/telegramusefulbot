@@ -11,6 +11,7 @@ anything.
 Engine: PyMuPDF (fitz) only -- see services.pdf.watermark.
 """
 import asyncio
+import re
 from typing import Dict, List
 
 from aiogram import Router, F
@@ -35,6 +36,7 @@ from utils.tempfiles import (
     get_tracked_files,
 )
 from utils.validators import validate_extension
+from utils.session_manager import register_stale_callbacks
 
 from .common import _PDF_MIME, _download_and_validate, _track_usage, _display_name
 
@@ -57,6 +59,9 @@ class WatermarkStates(StatesGroup):
     waiting_for_position = State()
     waiting_for_rotation = State()
     waiting_for_opacity = State()
+    waiting_for_opacity_custom = State()
+    waiting_for_color = State()
+    waiting_for_style = State()
     waiting_for_size = State()
     waiting_for_summary = State()
 
@@ -65,6 +70,7 @@ class WatermarkStates(StatesGroup):
     waiting_for_image_position = State()
     waiting_for_image_size = State()
     waiting_for_image_opacity = State()
+    waiting_for_image_opacity_custom = State()
     waiting_for_image_summary = State()
 
     waiting_for_cancel_confirm = State()
@@ -77,12 +83,16 @@ _ALL_WM_STATES = (
     WatermarkStates.waiting_for_position,
     WatermarkStates.waiting_for_rotation,
     WatermarkStates.waiting_for_opacity,
+    WatermarkStates.waiting_for_opacity_custom,
+    WatermarkStates.waiting_for_color,
+    WatermarkStates.waiting_for_style,
     WatermarkStates.waiting_for_size,
     WatermarkStates.waiting_for_summary,
     WatermarkStates.waiting_for_image,
     WatermarkStates.waiting_for_image_position,
     WatermarkStates.waiting_for_image_size,
     WatermarkStates.waiting_for_image_opacity,
+    WatermarkStates.waiting_for_image_opacity_custom,
     WatermarkStates.waiting_for_image_summary,
     WatermarkStates.waiting_for_cancel_confirm,
 )
@@ -102,15 +112,22 @@ WM_CB_TYPE_IMAGE = "pdfwm:type_image"
 WM_CB_POS_PREFIX = "pdfwm:pos:"
 WM_CB_ROT_PREFIX = "pdfwm:rot:"
 WM_CB_OPA_PREFIX = "pdfwm:opa:"
+WM_CB_OPA_CUSTOM = "pdfwm:opa_custom"
+WM_CB_COLOR_PREFIX = "pdfwm:color:"
+WM_CB_STYLE_PREFIX = "pdfwm:style:"
 WM_CB_SIZE_PREFIX = "pdfwm:size:"
 
 WM_CB_SUM_POSITION = "pdfwm:sum_position"
 WM_CB_SUM_ROTATION = "pdfwm:sum_rotation"
 WM_CB_SUM_OPACITY = "pdfwm:sum_opacity"
+WM_CB_SUM_COLOR = "pdfwm:sum_color"
+WM_CB_SUM_STYLE = "pdfwm:sum_style"
 WM_CB_SUM_SIZE = "pdfwm:sum_size"
 WM_CB_SUM_EDIT_TEXT = "pdfwm:sum_edit_text"
 WM_CB_SUM_CHANGE_IMAGE = "pdfwm:sum_change_image"
 WM_CB_APPLY = "pdfwm:apply"
+
+register_stale_callbacks(prefix="pdfwm:")
 
 _IMAGE_WM_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 _IMAGE_WM_MIMES = {"image/png", "image/jpeg", "image/webp"}
@@ -130,14 +147,40 @@ _POSITION_LABELS = {
     "header": "Header",
     "footer": "Footer",
 }
-_ROTATION_LABELS = {"diagonal": "Diagonal", "horizontal": "Horizontal", "vertical": "Vertical"}
+_ROTATION_LABELS = {
+    "diagonal": "Diagonal",
+    "reverse_diagonal": "Reverse Diagonal",
+    "horizontal": "Horizontal",
+    "vertical": "Vertical",
+}
 _TEXT_SIZE_LABELS = {"small": "Small", "medium": "Medium", "large": "Large", "auto": "Auto"}
 _IMAGE_SIZE_LABELS = {"small": "Small", "medium": "Medium", "large": "Large", "original": "Original"}
+
+_COLOR_LABELS = {
+    "black": "⚫ Black",
+    "white": "⚪ White",
+    "red": "🔴 Red",
+    "blue": "🔵 Blue",
+    "green": "🟢 Green",
+    "yellow": "🟡 Yellow",
+    "purple": "🟣 Purple",
+    "orange": "🟠 Orange",
+    "brown": "🟤 Brown",
+    "pink": "🌸 Pink",
+}
+_STYLE_LABELS = {
+    "normal": "Normal",
+    "bold": "Bold",
+    "italic": "Italic",
+    "bold_italic": "Bold Italic",
+}
 
 _DEFAULTS = {
     "wm_position": "center",
     "wm_rotation": "diagonal",
     "wm_opacity": 25,
+    "wm_color": "black",
+    "wm_style": "normal",
     "wm_size": "auto",
 }
 _IMAGE_DEFAULTS = {
@@ -194,11 +237,12 @@ def _position_keyboard():
 def _rotation_keyboard():
     b = InlineKeyboardBuilder()
     b.button(text="╱ Diagonal", callback_data=f"{WM_CB_ROT_PREFIX}diagonal")
+    b.button(text="╲ Reverse Diagonal", callback_data=f"{WM_CB_ROT_PREFIX}reverse_diagonal")
     b.button(text="─ Horizontal", callback_data=f"{WM_CB_ROT_PREFIX}horizontal")
     b.button(text="│ Vertical", callback_data=f"{WM_CB_ROT_PREFIX}vertical")
     b.button(text="↩ Back", callback_data=WM_CB_BACK)
     b.button(text="❌ Cancel", callback_data=WM_CB_CANCEL)
-    b.adjust(1, 1, 1, 1, 1)
+    b.adjust(2, 2, 1, 1)
     return b.as_markup()
 
 
@@ -206,9 +250,32 @@ def _opacity_keyboard():
     b = InlineKeyboardBuilder()
     for pct in (10, 25, 50, 75, 100):
         b.button(text=f"{pct}%", callback_data=f"{WM_CB_OPA_PREFIX}{pct}")
+    b.button(text="✏ Custom", callback_data=WM_CB_OPA_CUSTOM)
     b.button(text="↩ Back", callback_data=WM_CB_BACK)
     b.button(text="❌ Cancel", callback_data=WM_CB_CANCEL)
-    b.adjust(5, 1, 1)
+    b.adjust(2, 2, 2, 1, 1)
+    return b.as_markup()
+
+
+def _color_keyboard():
+    b = InlineKeyboardBuilder()
+    for key in ("black", "white", "red", "blue", "green", "yellow", "purple", "orange", "brown", "pink"):
+        b.button(text=_COLOR_LABELS[key], callback_data=f"{WM_CB_COLOR_PREFIX}{key}")
+    b.button(text="↩ Back", callback_data=WM_CB_BACK)
+    b.button(text="❌ Cancel", callback_data=WM_CB_CANCEL)
+    b.adjust(2, 2, 2, 2, 2, 1, 1)
+    return b.as_markup()
+
+
+def _style_keyboard():
+    b = InlineKeyboardBuilder()
+    b.button(text="Normal", callback_data=f"{WM_CB_STYLE_PREFIX}normal")
+    b.button(text="Bold", callback_data=f"{WM_CB_STYLE_PREFIX}bold")
+    b.button(text="Italic", callback_data=f"{WM_CB_STYLE_PREFIX}italic")
+    b.button(text="Bold Italic", callback_data=f"{WM_CB_STYLE_PREFIX}bold_italic")
+    b.button(text="↩ Back", callback_data=WM_CB_BACK)
+    b.button(text="❌ Cancel", callback_data=WM_CB_CANCEL)
+    b.adjust(2, 2, 1, 1)
     return b.as_markup()
 
 
@@ -241,11 +308,13 @@ def _text_summary_keyboard():
     b.button(text="📍 Position", callback_data=WM_CB_SUM_POSITION)
     b.button(text="🔄 Rotation", callback_data=WM_CB_SUM_ROTATION)
     b.button(text="👁 Opacity", callback_data=WM_CB_SUM_OPACITY)
-    b.button(text="🔠 Size", callback_data=WM_CB_SUM_SIZE)
+    b.button(text="🎨 Color", callback_data=WM_CB_SUM_COLOR)
+    b.button(text="🔠 Style", callback_data=WM_CB_SUM_STYLE)
+    b.button(text="📏 Size", callback_data=WM_CB_SUM_SIZE)
     b.button(text="✏ Edit Text", callback_data=WM_CB_SUM_EDIT_TEXT)
     b.button(text="✅ Apply", callback_data=WM_CB_APPLY)
     b.button(text="❌ Cancel", callback_data=WM_CB_CANCEL)
-    b.adjust(2, 2, 1, 1, 1)
+    b.adjust(2, 2, 2, 1, 1, 1)
     return b.as_markup()
 
 
@@ -304,6 +373,18 @@ def _render_opacity_text() -> str:
     return "Choose opacity."
 
 
+def _render_opacity_custom_text() -> str:
+    return "✏ Custom Opacity\n\nEnter opacity (1–100)."
+
+
+def _render_color_text() -> str:
+    return "Choose watermark text color."
+
+
+def _render_style_text() -> str:
+    return "Choose watermark text style."
+
+
 def _render_text_size_text() -> str:
     return "Choose text size."
 
@@ -321,6 +402,10 @@ def _render_text_summary(data: dict) -> str:
         f"{_ROTATION_LABELS.get(data.get('wm_rotation'), '-')}\n\n"
         "Opacity:\n"
         f"{data.get('wm_opacity')}%\n\n"
+        "Color:\n"
+        f"{_COLOR_LABELS.get(data.get('wm_color'), '-')}\n\n"
+        "Style:\n"
+        f"{_STYLE_LABELS.get(data.get('wm_style'), '-')}\n\n"
         "Size:\n"
         f"{_TEXT_SIZE_LABELS.get(data.get('wm_size'), '-')}"
     )
@@ -449,8 +534,8 @@ async def _process_single_wm_pdf(message: Message, state: FSMContext, db_user=No
         return
 
     path = await _download_and_validate(message, state, SUPPORTED_PDF_EXTS, _PDF_MIME, "PDF", db_user=db_user)
-    await _delete_message_silently(message)
     if path is None:
+        await _delete_message_silently(message)
         await _send_temp_validation_error(message.bot, message.chat.id, "❌ Please send a valid PDF document.")
         await _show(message.bot, state, message.chat.id, _render_upload_text(), _upload_keyboard())
         return
@@ -624,6 +709,74 @@ async def pdf_watermark_opacity_chosen(query: CallbackQuery, state: FSMContext):
     await _after_field_selected(
         query, state,
         WatermarkStates.waiting_for_summary, _render_text_summary, _text_summary_keyboard,
+        WatermarkStates.waiting_for_color, _render_color_text(), _color_keyboard(),
+    )
+
+
+@router.callback_query(WatermarkStates.waiting_for_opacity, F.data == WM_CB_OPA_CUSTOM)
+async def pdf_watermark_opacity_custom_prompt(query: CallbackQuery, state: FSMContext):
+    await query.answer()
+    await state.set_state(WatermarkStates.waiting_for_opacity_custom)
+    await _show(query.bot, state, query.message.chat.id, _render_opacity_custom_text(), _back_cancel_keyboard())
+
+
+def _parse_opacity_input(text: str):
+    t = (text or "").strip()
+    if not re.fullmatch(r"[0-9]+", t):
+        return None
+    value = int(t)
+    if value < 1 or value > 100:
+        return None
+    return value
+
+
+@router.message(WatermarkStates.waiting_for_opacity_custom, F.text)
+async def pdf_watermark_opacity_custom_received(message: Message, state: FSMContext):
+    value = _parse_opacity_input(message.text)
+    await _delete_message_silently(message)
+    if value is None:
+        await _send_temp_validation_error(message.bot, message.chat.id, "❌ Please enter a number between 1 and 100.")
+        return
+
+    await state.update_data(wm_opacity=value)
+    data = await state.get_data()
+    if data.get("wm_edit_return"):
+        await state.update_data(wm_edit_return=False)
+        await state.set_state(WatermarkStates.waiting_for_summary)
+        fresh = await state.get_data()
+        await _show(message.bot, state, message.chat.id, _render_text_summary(fresh), _text_summary_keyboard())
+        return
+
+    await state.set_state(WatermarkStates.waiting_for_color)
+    await _show(message.bot, state, message.chat.id, _render_color_text(), _color_keyboard())
+
+
+@router.message(WatermarkStates.waiting_for_opacity_custom)
+async def pdf_watermark_opacity_custom_invalid(message: Message):
+    await _delete_message_silently(message)
+    await _send_temp_validation_error(message.bot, message.chat.id, "❌ Please enter a number between 1 and 100.")
+
+
+@router.callback_query(WatermarkStates.waiting_for_color, F.data.startswith(WM_CB_COLOR_PREFIX))
+async def pdf_watermark_color_chosen(query: CallbackQuery, state: FSMContext):
+    await query.answer()
+    color = query.data[len(WM_CB_COLOR_PREFIX):]
+    await state.update_data(wm_color=color)
+    await _after_field_selected(
+        query, state,
+        WatermarkStates.waiting_for_summary, _render_text_summary, _text_summary_keyboard,
+        WatermarkStates.waiting_for_style, _render_style_text(), _style_keyboard(),
+    )
+
+
+@router.callback_query(WatermarkStates.waiting_for_style, F.data.startswith(WM_CB_STYLE_PREFIX))
+async def pdf_watermark_style_chosen(query: CallbackQuery, state: FSMContext):
+    await query.answer()
+    style = query.data[len(WM_CB_STYLE_PREFIX):]
+    await state.update_data(wm_style=style)
+    await _after_field_selected(
+        query, state,
+        WatermarkStates.waiting_for_summary, _render_text_summary, _text_summary_keyboard,
         WatermarkStates.waiting_for_size, _render_text_size_text(), _text_size_keyboard(),
     )
 
@@ -673,6 +826,22 @@ async def pdf_watermark_sum_size(query: CallbackQuery, state: FSMContext):
     await state.update_data(wm_edit_return=True)
     await state.set_state(WatermarkStates.waiting_for_size)
     await _show(query.bot, state, query.message.chat.id, _render_text_size_text(), _text_size_keyboard())
+
+
+@router.callback_query(WatermarkStates.waiting_for_summary, F.data == WM_CB_SUM_COLOR)
+async def pdf_watermark_sum_color(query: CallbackQuery, state: FSMContext):
+    await query.answer()
+    await state.update_data(wm_edit_return=True)
+    await state.set_state(WatermarkStates.waiting_for_color)
+    await _show(query.bot, state, query.message.chat.id, _render_color_text(), _color_keyboard())
+
+
+@router.callback_query(WatermarkStates.waiting_for_summary, F.data == WM_CB_SUM_STYLE)
+async def pdf_watermark_sum_style(query: CallbackQuery, state: FSMContext):
+    await query.answer()
+    await state.update_data(wm_edit_return=True)
+    await state.set_state(WatermarkStates.waiting_for_style)
+    await _show(query.bot, state, query.message.chat.id, _render_style_text(), _style_keyboard())
 
 
 @router.callback_query(WatermarkStates.waiting_for_summary, F.data == WM_CB_SUM_EDIT_TEXT)
@@ -788,6 +957,34 @@ async def pdf_watermark_image_opacity_chosen(query: CallbackQuery, state: FSMCon
     await _show(query.bot, state, query.message.chat.id, _render_image_summary(fresh), _image_summary_keyboard())
 
 
+@router.callback_query(WatermarkStates.waiting_for_image_opacity, F.data == WM_CB_OPA_CUSTOM)
+async def pdf_watermark_image_opacity_custom_prompt(query: CallbackQuery, state: FSMContext):
+    await query.answer()
+    await state.set_state(WatermarkStates.waiting_for_image_opacity_custom)
+    await _show(query.bot, state, query.message.chat.id, _render_opacity_custom_text(), _back_cancel_keyboard())
+
+
+@router.message(WatermarkStates.waiting_for_image_opacity_custom, F.text)
+async def pdf_watermark_image_opacity_custom_received(message: Message, state: FSMContext):
+    value = _parse_opacity_input(message.text)
+    await _delete_message_silently(message)
+    if value is None:
+        await _send_temp_validation_error(message.bot, message.chat.id, "❌ Please enter a number between 1 and 100.")
+        return
+
+    await state.update_data(wm_opacity=value)
+    await state.update_data(wm_edit_return=False)
+    await state.set_state(WatermarkStates.waiting_for_image_summary)
+    fresh = await state.get_data()
+    await _show(message.bot, state, message.chat.id, _render_image_summary(fresh), _image_summary_keyboard())
+
+
+@router.message(WatermarkStates.waiting_for_image_opacity_custom)
+async def pdf_watermark_image_opacity_custom_invalid(message: Message):
+    await _delete_message_silently(message)
+    await _send_temp_validation_error(message.bot, message.chat.id, "❌ Please enter a number between 1 and 100.")
+
+
 # --------------------------------------------------------------------------
 # Image summary screen: edit buttons + Apply
 # --------------------------------------------------------------------------
@@ -871,6 +1068,8 @@ async def pdf_watermark_apply(query: CallbackQuery, state: FSMContext, user_repo
                 data.get("wm_rotation", "diagonal"),
                 int(data.get("wm_opacity", 25)),
                 data.get("wm_size", "auto"),
+                data.get("wm_color", "black"),
+                data.get("wm_style", "normal"),
             )
         else:
             image_path = data.get("wm_image_path")
@@ -973,7 +1172,11 @@ async def pdf_watermark_back(query: CallbackQuery, state: FSMContext):
             await state.set_state(WatermarkStates.waiting_for_rotation)
             await _show(query.bot, state, chat_id, _render_rotation_text(), _rotation_keyboard())
 
-    elif current == WatermarkStates.waiting_for_size.state:
+    elif current == WatermarkStates.waiting_for_opacity_custom.state:
+        await state.set_state(WatermarkStates.waiting_for_opacity)
+        await _show(query.bot, state, chat_id, _render_opacity_text(), _opacity_keyboard())
+
+    elif current == WatermarkStates.waiting_for_color.state:
         if data.get("wm_edit_return"):
             await state.update_data(wm_edit_return=False)
             await state.set_state(WatermarkStates.waiting_for_summary)
@@ -981,6 +1184,24 @@ async def pdf_watermark_back(query: CallbackQuery, state: FSMContext):
         else:
             await state.set_state(WatermarkStates.waiting_for_opacity)
             await _show(query.bot, state, chat_id, _render_opacity_text(), _opacity_keyboard())
+
+    elif current == WatermarkStates.waiting_for_style.state:
+        if data.get("wm_edit_return"):
+            await state.update_data(wm_edit_return=False)
+            await state.set_state(WatermarkStates.waiting_for_summary)
+            await _show(query.bot, state, chat_id, _render_text_summary(data), _text_summary_keyboard())
+        else:
+            await state.set_state(WatermarkStates.waiting_for_color)
+            await _show(query.bot, state, chat_id, _render_color_text(), _color_keyboard())
+
+    elif current == WatermarkStates.waiting_for_size.state:
+        if data.get("wm_edit_return"):
+            await state.update_data(wm_edit_return=False)
+            await state.set_state(WatermarkStates.waiting_for_summary)
+            await _show(query.bot, state, chat_id, _render_text_summary(data), _text_summary_keyboard())
+        else:
+            await state.set_state(WatermarkStates.waiting_for_style)
+            await _show(query.bot, state, chat_id, _render_style_text(), _style_keyboard())
 
     elif current == WatermarkStates.waiting_for_image.state:
         if data.get("wm_edit_return"):
@@ -1018,6 +1239,10 @@ async def pdf_watermark_back(query: CallbackQuery, state: FSMContext):
             await state.set_state(WatermarkStates.waiting_for_image_size)
             await _show(query.bot, state, chat_id, _render_image_size_text(), _image_size_keyboard())
 
+    elif current == WatermarkStates.waiting_for_image_opacity_custom.state:
+        await state.set_state(WatermarkStates.waiting_for_image_opacity)
+        await _show(query.bot, state, chat_id, _render_opacity_text(), _opacity_keyboard())
+
 
 # --------------------------------------------------------------------------
 # Cancel -- available from every state, requires confirmation
@@ -1048,12 +1273,16 @@ _SCREEN_RENDERERS = {
     WatermarkStates.waiting_for_position.state: lambda d: (_render_position_text(), _position_keyboard()),
     WatermarkStates.waiting_for_rotation.state: lambda d: (_render_rotation_text(), _rotation_keyboard()),
     WatermarkStates.waiting_for_opacity.state: lambda d: (_render_opacity_text(), _opacity_keyboard()),
+    WatermarkStates.waiting_for_opacity_custom.state: lambda d: (_render_opacity_custom_text(), _back_cancel_keyboard()),
+    WatermarkStates.waiting_for_color.state: lambda d: (_render_color_text(), _color_keyboard()),
+    WatermarkStates.waiting_for_style.state: lambda d: (_render_style_text(), _style_keyboard()),
     WatermarkStates.waiting_for_size.state: lambda d: (_render_text_size_text(), _text_size_keyboard()),
     WatermarkStates.waiting_for_summary.state: lambda d: (_render_text_summary(d), _text_summary_keyboard()),
     WatermarkStates.waiting_for_image.state: lambda d: (_render_image_prompt(), _back_cancel_keyboard()),
     WatermarkStates.waiting_for_image_position.state: lambda d: (_render_position_text(), _position_keyboard()),
     WatermarkStates.waiting_for_image_size.state: lambda d: (_render_image_size_text(), _image_size_keyboard()),
     WatermarkStates.waiting_for_image_opacity.state: lambda d: (_render_opacity_text(), _opacity_keyboard()),
+    WatermarkStates.waiting_for_image_opacity_custom.state: lambda d: (_render_opacity_custom_text(), _back_cancel_keyboard()),
     WatermarkStates.waiting_for_image_summary.state: lambda d: (_render_image_summary(d), _image_summary_keyboard()),
 }
 
@@ -1081,6 +1310,8 @@ _BUTTON_ONLY_STATES = (
     WatermarkStates.waiting_for_position,
     WatermarkStates.waiting_for_rotation,
     WatermarkStates.waiting_for_opacity,
+    WatermarkStates.waiting_for_color,
+    WatermarkStates.waiting_for_style,
     WatermarkStates.waiting_for_size,
     WatermarkStates.waiting_for_summary,
     WatermarkStates.waiting_for_image_position,
@@ -1095,18 +1326,3 @@ _BUTTON_ONLY_STATES = (
 async def pdf_watermark_button_only_screen_message(message: Message):
     await _delete_message_silently(message)
 
-
-# --------------------------------------------------------------------------
-# Stale-button safety net -- same rationale as Rotate/Rearrange's: if
-# /start or another flow already cleared the FSM state, an old Watermark
-# inline keyboard still on screen would otherwise spin forever with no
-# reply when pressed.
-# --------------------------------------------------------------------------
-
-@router.callback_query(StateFilter(None), F.data.startswith("pdfwm:"))
-async def pdf_watermark_stale_callback(query: CallbackQuery):
-    await query.answer("This session has expired. Please start again from the menu.", show_alert=True)
-    try:
-        await query.message.edit_reply_markup(reply_markup=None)
-    except Exception as e:
-        logger.debug(f"Watermark: could not strip keyboard from stale callback message: {e}")
