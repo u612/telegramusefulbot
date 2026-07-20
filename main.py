@@ -23,6 +23,7 @@ from bot.handlers import (
 from bot.middlewares import LoggingMiddleware, DatabaseMiddleware, ThrottlingMiddleware
 from database.session import engine, Base, run_light_migrations
 from services.security.validator import init_validator
+from utils.session_manager import router as session_manager_router
 from services.telegram import shutdown_userbot
 
 # Initialize bot and dispatcher
@@ -47,6 +48,10 @@ dp.include_router(document_router)
 dp.include_router(ocr_router)
 dp.include_router(settings_router)
 dp.include_router(owner_router)
+# Included last: the shared stale-session handler only ever fires when a
+# callback's FSM state is already None, so it must never shadow a tool's
+# own in-progress-flow handlers above.
+dp.include_router(session_manager_router)
 
 
 @dp.errors()
