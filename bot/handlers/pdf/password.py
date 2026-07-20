@@ -23,12 +23,11 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.filters import StateFilter
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from bot.states.pdf import PDFStates
 from bot.keyboards.pdf import get_pdf_menu, PDF_ADD_PASSWORD, PDF_REMOVE_PASSWORD
-from bot.keyboards.common import back_home_cancel
 from core.constants import SUPPORTED_PDF_EXTS, MERGE_BATCH_FINALIZE_DELAY_SECONDS
 from core.logger import logger
-from utils.limits import get_effective_limits
+
+from pypdf import PdfReader
 
 from services.pdf._common import PDFProcessingError, open_pdf_reader
 from services.pdf.password import PDFPassword
@@ -846,55 +845,608 @@ async def pdf_add_password_button_only_screen_message(message: Message):
 
 
 # ==========================================================================
-# Remove Password (unchanged)
+# Remove Password (rebuilt to mirror Add Password's UX exactly: a single,
+# repeatedly-edited workflow message, uploads/inputs deleted as consumed,
+# temporary auto-deleting validation errors, context-aware Back, and a
+# confirm-before-discard Cancel. Verifying the current password unlocks a
+# choice between removing it outright or replacing it with a new one.)
 # ==========================================================================
 
+class RemovePasswordStates(StatesGroup):
+    waiting_for_file = State()
+    waiting_for_password = State()
+    waiting_for_unlocked_menu = State()
+    waiting_for_new_password = State()
+    waiting_for_confirm_new_password = State()
+    waiting_for_cancel_confirm = State()
+
+
+_ALL_RMPWD_STATES = (
+    RemovePasswordStates.waiting_for_file,
+    RemovePasswordStates.waiting_for_password,
+    RemovePasswordStates.waiting_for_unlocked_menu,
+    RemovePasswordStates.waiting_for_new_password,
+    RemovePasswordStates.waiting_for_confirm_new_password,
+    RemovePasswordStates.waiting_for_cancel_confirm,
+)
+
+RMPWD_CB_CANCEL = "pdfrmpwd:cancel"
+RMPWD_CB_CANCEL_YES = "pdfrmpwd:cancel_yes"
+RMPWD_CB_CANCEL_NO = "pdfrmpwd:cancel_no"
+RMPWD_CB_BACK = "pdfrmpwd:back"
+RMPWD_CB_REMOVE = "pdfrmpwd:remove"
+RMPWD_CB_CHANGE = "pdfrmpwd:change"
+
+register_stale_callbacks(prefix="pdfrmpwd:")
+
+# Buffers for the case a PDF arrives as part of a Telegram media group
+# (album) -- Remove Password only ever accepts ONE PDF, so a whole album
+# must be rejected as a unit, same convention as Add Password.
+_rmpwd_pending_groups: Dict[str, List[Message]] = {}
+_rmpwd_group_tasks: Dict[str, "asyncio.Task"] = {}
+
+
+# --------------------------------------------------------------------------
+# Keyboards
+# --------------------------------------------------------------------------
+
+def _rmpwd_cancel_only_keyboard():
+    b = InlineKeyboardBuilder()
+    b.button(text="\u274c Cancel", callback_data=RMPWD_CB_CANCEL)
+    b.adjust(1)
+    return b.as_markup()
+
+
+def _rmpwd_back_cancel_keyboard():
+    b = InlineKeyboardBuilder()
+    b.button(text="\u21a9 Back", callback_data=RMPWD_CB_BACK)
+    b.button(text="\u274c Cancel", callback_data=RMPWD_CB_CANCEL)
+    b.adjust(1, 1)
+    return b.as_markup()
+
+
+def _rmpwd_unlocked_keyboard():
+    b = InlineKeyboardBuilder()
+    b.button(text="\U0001F513 Remove Password", callback_data=RMPWD_CB_REMOVE)
+    b.button(text="\U0001F511 Change Password", callback_data=RMPWD_CB_CHANGE)
+    b.button(text="\u274c Cancel", callback_data=RMPWD_CB_CANCEL)
+    b.adjust(1, 1, 1)
+    return b.as_markup()
+
+
+def _rmpwd_cancel_confirm_keyboard():
+    b = InlineKeyboardBuilder()
+    b.button(text="\u2705 Yes, Cancel", callback_data=RMPWD_CB_CANCEL_YES)
+    b.button(text="\u21a9 Continue", callback_data=RMPWD_CB_CANCEL_NO)
+    b.adjust(1, 1)
+    return b.as_markup()
+
+
+# --------------------------------------------------------------------------
+# Screen text renderers
+# --------------------------------------------------------------------------
+
+def _render_rmpwd_upload_text() -> str:
+    return (
+        "\U0001F513 Remove Password\n\n"
+        "Remove the password from an encrypted PDF.\n\n"
+        "Please send the password-protected PDF."
+    )
+
+
+def _render_rmpwd_password_prompt() -> str:
+    return "\u2705 PDF received.\n\nEnter the current password to unlock your PDF."
+
+
+def _render_rmpwd_verifying_text() -> str:
+    return "\u23f3 Verifying password..."
+
+
+def _render_rmpwd_unlocked_text() -> str:
+    return (
+        "\u2705 Password verified.\n\n"
+        "Your PDF has been unlocked.\n\n"
+        "What would you like to do?"
+    )
+
+
+def _render_rmpwd_change_prompt() -> str:
+    return "\U0001F511 Change Password\n\nEnter a new password.\n\nRequirements\n\n\u2022 4\u2013128 characters"
+
+
+def _render_rmpwd_confirm_new_text() -> str:
+    return "Confirm your new password."
+
+
+def _render_rmpwd_cancel_confirm_text() -> str:
+    return "\u26a0\ufe0f Cancel this operation?\n\nYour current progress will be lost."
+
+
+# --------------------------------------------------------------------------
+# Prompt edit/send helper (edit existing bot message whenever possible),
+# temp validation errors, and cleanup -- same conventions as Add Password.
+# --------------------------------------------------------------------------
+
+async def _rmpwd_show(bot, state: FSMContext, chat_id: int, text: str, keyboard=None) -> None:
+    data = await state.get_data()
+    message_id = data.get("rmpwd_prompt_message_id")
+    if message_id is not None:
+        try:
+            await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=keyboard)
+            return
+        except Exception as e:
+            logger.debug(f"Remove Password: edit failed, sending new prompt: {e}")
+
+    sent = await bot.send_message(chat_id, text, reply_markup=keyboard)
+    await state.update_data(rmpwd_prompt_message_id=sent.message_id)
+
+
+async def _rmpwd_full_cleanup(state: FSMContext) -> None:
+    files = await get_tracked_files(state)
+    if files:
+        delete_paths(files)
+        await untrack_temp_files(state, files)
+    await state.clear()
+
+
+# --------------------------------------------------------------------------
+# Step 1: entry + PDF upload
+# --------------------------------------------------------------------------
 
 @router.callback_query(F.data == PDF_REMOVE_PASSWORD)
 async def pdf_remove_password_start(query: CallbackQuery, state: FSMContext):
-    await state.set_state(PDFStates.waiting_for_file_password_remove)
-    await query.message.edit_text("Send the password-protected PDF file.", reply_markup=back_home_cancel())
+    await state.set_state(RemovePasswordStates.waiting_for_file)
+    await query.message.edit_text(_render_rmpwd_upload_text(), reply_markup=_rmpwd_cancel_only_keyboard())
+    await state.update_data(rmpwd_prompt_message_id=query.message.message_id)
     await query.answer()
 
 
-@router.message(PDFStates.waiting_for_file_password_remove, F.document)
-async def pdf_remove_password_receive(message: Message, state: FSMContext, db_user=None):
+async def _process_single_rmpwd_pdf(message: Message, state: FSMContext, db_user=None) -> None:
     doc = message.document
-    if doc is None:
-        await message.answer("Please send a PDF file as a document.")
-        return
-    limits = get_effective_limits(message.from_user.id, db_user)
-    if not limits.unlimited and doc.file_size and doc.file_size > limits.file_size:
-        limit_mb = limits.file_size // (1024 * 1024)
-        await message.answer(f"File too large (max {limit_mb} MB).")
-        return
     if not validate_extension(doc.file_name or "", SUPPORTED_PDF_EXTS):
-        await message.answer("Only .pdf files are supported for this action.")
-        return
-    path = new_temp_path(suffix=".pdf")
-    await track_temp_file(state, path)
-    await message.bot.download(doc, destination=path)
-    await state.update_data(password_remove_input_path=path)
-    await state.set_state(PDFStates.waiting_for_password_remove_value)
-    await message.answer("Send the current password for this PDF.", reply_markup=back_home_cancel())
-
-
-@router.message(PDFStates.waiting_for_password_remove_value, F.text)
-async def pdf_remove_password_process(message: Message, state: FSMContext, user_repo=None, db_user=None):
-    data = await state.get_data()
-    path = data.get("password_remove_input_path")
-    if not path:
-        await message.answer("Session expired, please start over.")
-        await state.clear()
+        await _delete_message_silently(message)
+        await _send_temp_validation_error(message.bot, message.chat.id, "\u274c Please send a PDF.")
         return
 
-    await message.answer("Removing password... please wait.")
+    path = await _download_and_validate(message, state, SUPPORTED_PDF_EXTS, _PDF_MIME, "PDF", db_user=db_user)
+    if path is None:
+        await _delete_message_silently(message)
+        await _send_temp_validation_error(message.bot, message.chat.id, "\u274c Please send a PDF.")
+        await _rmpwd_show(message.bot, state, message.chat.id, _render_rmpwd_upload_text(), _rmpwd_cancel_only_keyboard())
+        return
+
+    # Detect encryption immediately, before ever asking for a password --
+    # open_pdf_reader() rejects already-encrypted PDFs by default, so we
+    # go straight to pypdf's PdfReader here (mirrors PDFPassword's own
+    # remove/verify path).
     try:
-        output_path = await PDFPassword().remove_password(path, message.text)
+        reader = PdfReader(path)
     except Exception as e:
-        await _fail(message, state, e, [path])
+        logger.debug(f"Remove Password: could not read uploaded PDF: {e}")
+        await untrack_temp_files(state, [path])
+        delete_paths([path])
+        await _send_temp_validation_error(message.bot, message.chat.id, "\u274c Invalid or corrupted PDF.")
+        await _rmpwd_show(message.bot, state, message.chat.id, _render_rmpwd_upload_text(), _rmpwd_cancel_only_keyboard())
+        return
+
+    if not reader.is_encrypted:
+        await untrack_temp_files(state, [path])
+        delete_paths([path])
+        data = await state.get_data()
+        old_prompt_id = data.get("rmpwd_prompt_message_id")
+        if old_prompt_id is not None:
+            try:
+                await message.bot.delete_message(chat_id=message.chat.id, message_id=old_prompt_id)
+            except Exception as e:
+                logger.debug(f"Remove Password: could not delete workflow message: {e}")
+        await message.bot.send_message(message.chat.id, "\u274c This PDF is not password protected.")
+        sent = await message.bot.send_message(
+            message.chat.id, _render_rmpwd_upload_text(), reply_markup=_rmpwd_cancel_only_keyboard()
+        )
+        await state.update_data(rmpwd_prompt_message_id=sent.message_id)
+        return
+
+    await state.update_data(rmpwd_input_path=path, rmpwd_filename=doc.file_name or "document.pdf")
+    await state.set_state(RemovePasswordStates.waiting_for_password)
+
+    data = await state.get_data()
+    old_prompt_id = data.get("rmpwd_prompt_message_id")
+    if old_prompt_id is not None:
+        try:
+            await message.bot.delete_message(chat_id=message.chat.id, message_id=old_prompt_id)
+        except Exception as e:
+            logger.debug(f"Remove Password: could not delete initial upload prompt: {e}")
+
+    sent = await message.answer(_render_rmpwd_password_prompt(), reply_markup=_rmpwd_cancel_only_keyboard())
+    await state.update_data(rmpwd_prompt_message_id=sent.message_id)
+
+
+async def _finalize_rmpwd_media_group(key: str, state: FSMContext, db_user) -> None:
+    try:
+        await asyncio.sleep(MERGE_BATCH_FINALIZE_DELAY_SECONDS)
+    except asyncio.CancelledError:
+        return
+    group = _rmpwd_pending_groups.pop(key, None)
+    _rmpwd_group_tasks.pop(key, None)
+    if not group:
+        return
+    if await state.get_state() != RemovePasswordStates.waiting_for_file.state:
+        return
+
+    if len(group) > 1:
+        for m in group:
+            await _delete_message_silently(m)
+        await _send_temp_validation_error(group[0].bot, group[0].chat.id, "\u274c Please send only one PDF.")
+        return
+
+    await _process_single_rmpwd_pdf(group[0], state, db_user=db_user)
+
+
+@router.message(RemovePasswordStates.waiting_for_file, F.document)
+async def pdf_remove_password_receive(message: Message, state: FSMContext, db_user=None):
+    if message.media_group_id:
+        key = f"{message.chat.id}:{message.media_group_id}"
+        group = _rmpwd_pending_groups.setdefault(key, [])
+        group.append(message)
+        old_task = _rmpwd_group_tasks.get(key)
+        if old_task and not old_task.done():
+            old_task.cancel()
+        _rmpwd_group_tasks[key] = asyncio.create_task(
+            _finalize_rmpwd_media_group(key, state, db_user)
+        )
+        return
+
+    await _process_single_rmpwd_pdf(message, state, db_user=db_user)
+
+
+@router.message(RemovePasswordStates.waiting_for_file)
+async def pdf_remove_password_receive_invalid(message: Message):
+    await _delete_message_silently(message)
+    await _send_temp_validation_error(message.bot, message.chat.id, "\u274c Please send a PDF.")
+
+
+# --------------------------------------------------------------------------
+# Step 2: enter current password + verify
+# --------------------------------------------------------------------------
+
+@router.message(RemovePasswordStates.waiting_for_password, F.text)
+async def pdf_remove_password_value_received(message: Message, state: FSMContext):
+    password = message.text or ""
+    await _delete_message_silently(message)
+
+    if not password:
+        await _send_temp_validation_error(message.bot, message.chat.id, "\u274c Password cannot be empty.")
+        return
+    if len(password) < MIN_PASSWORD_LEN:
+        await _send_temp_validation_error(
+            message.bot, message.chat.id, "\u274c Password must contain at least 4 characters."
+        )
+        return
+    if len(password) > MAX_PASSWORD_LEN:
+        await _send_temp_validation_error(message.bot, message.chat.id, "\u274c Password cannot exceed 128 characters.")
+        return
+
+    data = await state.get_data()
+    input_path = data.get("rmpwd_input_path")
+    if not input_path:
+        await _rmpwd_full_cleanup(state)
+        await message.bot.send_message(message.chat.id, "Session expired, please start over.")
+        await message.bot.send_message(
+            message.chat.id, "\U0001F4C4 PDF Toolkit -- choose an operation:", reply_markup=get_pdf_menu()
+        )
+        return
+
+    await _rmpwd_show(message.bot, state, message.chat.id, _render_rmpwd_verifying_text(), None)
+
+    try:
+        verified = await PDFPassword().verify_password(input_path, password)
+    except PDFProcessingError as e:
+        logger.info(f"Remove Password: verification error: {e}")
+        await _rmpwd_full_cleanup(state)
+        await message.bot.send_message(message.chat.id, f"\u274c {e}")
+        await message.bot.send_message(
+            message.chat.id, "\U0001F4C4 PDF Toolkit -- choose an operation:", reply_markup=get_pdf_menu()
+        )
+        return
+    except Exception as e:
+        logger.exception(f"Remove Password: unexpected verification error: {e}")
+        await _rmpwd_full_cleanup(state)
+        await message.bot.send_message(message.chat.id, "\u274c Failed to verify the password.\n\nPlease try again.")
+        await message.bot.send_message(
+            message.chat.id, "\U0001F4C4 PDF Toolkit -- choose an operation:", reply_markup=get_pdf_menu()
+        )
+        return
+
+    if not verified:
+        await _send_temp_validation_error(message.bot, message.chat.id, "\u274c Incorrect password.\n\nPlease try again.")
+        await state.set_state(RemovePasswordStates.waiting_for_password)
+        await _rmpwd_show(message.bot, state, message.chat.id, _render_rmpwd_password_prompt(), _rmpwd_cancel_only_keyboard())
+        return
+
+    await state.update_data(rmpwd_password=password)
+    await state.set_state(RemovePasswordStates.waiting_for_unlocked_menu)
+    await _rmpwd_show(message.bot, state, message.chat.id, _render_rmpwd_unlocked_text(), _rmpwd_unlocked_keyboard())
+
+
+@router.message(RemovePasswordStates.waiting_for_password)
+async def pdf_remove_password_value_invalid(message: Message):
+    await _delete_message_silently(message)
+    await _send_temp_validation_error(message.bot, message.chat.id, "\u274c Password cannot be empty.")
+
+
+@router.message(StateFilter(RemovePasswordStates.waiting_for_unlocked_menu, RemovePasswordStates.waiting_for_cancel_confirm))
+async def pdf_remove_password_button_only_screen_message(message: Message):
+    await _delete_message_silently(message)
+
+
+# --------------------------------------------------------------------------
+# Unlocked menu: Remove Password
+# --------------------------------------------------------------------------
+
+@router.callback_query(RemovePasswordStates.waiting_for_unlocked_menu, F.data == RMPWD_CB_REMOVE)
+async def pdf_remove_password_do_remove(query: CallbackQuery, state: FSMContext, user_repo=None, db_user=None):
+    await query.answer()
+    chat_id = query.message.chat.id
+    data = await state.get_data()
+    input_path = data.get("rmpwd_input_path")
+    password = data.get("rmpwd_password", "")
+
+    if not input_path:
+        await _rmpwd_full_cleanup(state)
+        await query.bot.send_message(chat_id, "Session expired, please start over.")
+        await query.bot.send_message(chat_id, "\U0001F4C4 PDF Toolkit -- choose an operation:", reply_markup=get_pdf_menu())
+        return
+
+    if data.get("rmpwd_processing"):
+        return
+    await state.update_data(rmpwd_processing=True)
+
+    try:
+        await query.bot.edit_message_text(
+            "\u23f3 Removing password...", chat_id=chat_id, message_id=query.message.message_id, reply_markup=None
+        )
+    except Exception as e:
+        logger.debug(f"Remove Password: could not edit to processing state: {e}")
+
+    cleanup_paths = [input_path]
+    try:
+        output_path = await PDFPassword().remove_password(input_path, password)
+    except Exception as e:
+        if isinstance(e, PDFProcessingError):
+            logger.info(f"Remove Password: processing error: {e}")
+        else:
+            logger.exception(f"Remove Password: unexpected processing error: {e}")
+        try:
+            await query.bot.delete_message(chat_id=chat_id, message_id=query.message.message_id)
+        except Exception as del_err:
+            logger.debug(f"Remove Password: could not delete processing message: {del_err}")
+        delete_paths(cleanup_paths)
+        await untrack_temp_files(state, cleanup_paths)
+        await state.clear()
+        await query.bot.send_message(chat_id, "\u274c Failed to remove the password.\n\nPlease try again.")
+        await query.bot.send_message(chat_id, "\U0001F4C4 PDF Toolkit -- choose an operation:", reply_markup=get_pdf_menu())
         return
 
     await track_temp_file(state, output_path)
     await _track_usage(user_repo, db_user)
-    await _finish_with_document(message, state, output_path, "unprotected.pdf", [path, output_path])
+    cleanup_paths.append(output_path)
+
+    filename = data.get("rmpwd_filename", "document.pdf")
+
+    try:
+        await query.bot.send_document(chat_id, FSInputFile(output_path, filename=filename))
+        success_text = (
+            "\u2705 Password removed successfully!\n\n"
+            "\U0001F4C4 File\n"
+            f"{_escape_html(filename)}\n\n"
+            "\U0001F513 Your PDF no longer requires a password to open."
+        )
+        await query.bot.send_message(chat_id, success_text, parse_mode="HTML")
+    finally:
+        try:
+            await query.bot.delete_message(chat_id=chat_id, message_id=query.message.message_id)
+        except Exception as e:
+            logger.debug(f"Remove Password: could not delete processing message: {e}")
+        delete_paths(cleanup_paths)
+        await untrack_temp_files(state, cleanup_paths)
+        await state.clear()
+
+    logger.info(f"Remove Password: completed for chat {chat_id}")
+
+
+# --------------------------------------------------------------------------
+# Unlocked menu: Change Password
+# --------------------------------------------------------------------------
+
+@router.callback_query(RemovePasswordStates.waiting_for_unlocked_menu, F.data == RMPWD_CB_CHANGE)
+async def pdf_remove_password_change_start(query: CallbackQuery, state: FSMContext):
+    await query.answer()
+    await state.set_state(RemovePasswordStates.waiting_for_new_password)
+    await _rmpwd_show(query.bot, state, query.message.chat.id, _render_rmpwd_change_prompt(), _rmpwd_cancel_only_keyboard())
+
+
+@router.message(RemovePasswordStates.waiting_for_new_password, F.text)
+async def pdf_remove_password_new_value_received(message: Message, state: FSMContext):
+    new_password = message.text or ""
+    await _delete_message_silently(message)
+
+    if not new_password:
+        await _send_temp_validation_error(message.bot, message.chat.id, "\u274c Password cannot be empty.")
+        return
+    if len(new_password) < MIN_PASSWORD_LEN:
+        await _send_temp_validation_error(
+            message.bot, message.chat.id, "\u274c Password must contain at least 4 characters."
+        )
+        return
+    if len(new_password) > MAX_PASSWORD_LEN:
+        await _send_temp_validation_error(message.bot, message.chat.id, "\u274c Password cannot exceed 128 characters.")
+        return
+
+    await state.update_data(rmpwd_new_password=new_password)
+    await state.set_state(RemovePasswordStates.waiting_for_confirm_new_password)
+    await _rmpwd_show(message.bot, state, message.chat.id, _render_rmpwd_confirm_new_text(), _rmpwd_back_cancel_keyboard())
+
+
+@router.message(RemovePasswordStates.waiting_for_new_password)
+async def pdf_remove_password_new_value_invalid(message: Message):
+    await _delete_message_silently(message)
+    await _send_temp_validation_error(message.bot, message.chat.id, "\u274c Password cannot be empty.")
+
+
+@router.message(RemovePasswordStates.waiting_for_confirm_new_password, F.text)
+async def pdf_remove_password_confirm_new_received(message: Message, state: FSMContext, user_repo=None, db_user=None):
+    confirm = message.text or ""
+    await _delete_message_silently(message)
+
+    data = await state.get_data()
+    new_password = data.get("rmpwd_new_password", "")
+
+    if confirm != new_password:
+        await _send_temp_validation_error(
+            message.bot, message.chat.id, "\u274c Passwords do not match.\n\nPlease confirm your new password again."
+        )
+        return
+
+    await _rmpwd_do_change(message.bot, message.chat.id, state, user_repo=user_repo, db_user=db_user)
+
+
+@router.message(RemovePasswordStates.waiting_for_confirm_new_password)
+async def pdf_remove_password_confirm_new_invalid(message: Message):
+    await _delete_message_silently(message)
+    await _send_temp_validation_error(
+        message.bot, message.chat.id, "\u274c Passwords do not match.\n\nPlease confirm your new password again."
+    )
+
+
+async def _rmpwd_do_change(bot, chat_id: int, state: FSMContext, user_repo=None, db_user=None) -> None:
+    data = await state.get_data()
+    input_path = data.get("rmpwd_input_path")
+    old_password = data.get("rmpwd_password", "")
+    new_password = data.get("rmpwd_new_password", "")
+
+    if not input_path:
+        await _rmpwd_full_cleanup(state)
+        await bot.send_message(chat_id, "Session expired, please start over.")
+        await bot.send_message(chat_id, "\U0001F4C4 PDF Toolkit -- choose an operation:", reply_markup=get_pdf_menu())
+        return
+
+    if data.get("rmpwd_processing"):
+        return
+    await state.update_data(rmpwd_processing=True)
+
+    prompt_message_id = data.get("rmpwd_prompt_message_id")
+    try:
+        if prompt_message_id is not None:
+            await bot.edit_message_text(
+                "\u23f3 Updating password...", chat_id=chat_id, message_id=prompt_message_id, reply_markup=None
+            )
+    except Exception as e:
+        logger.debug(f"Remove Password: could not edit to processing state: {e}")
+
+    cleanup_paths = [input_path]
+    try:
+        output_path = await PDFPassword().change_password(input_path, old_password, new_password)
+    except Exception as e:
+        if isinstance(e, PDFProcessingError):
+            logger.info(f"Change Password: processing error: {e}")
+        else:
+            logger.exception(f"Change Password: unexpected processing error: {e}")
+        if prompt_message_id is not None:
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=prompt_message_id)
+            except Exception as del_err:
+                logger.debug(f"Change Password: could not delete processing message: {del_err}")
+        delete_paths(cleanup_paths)
+        await untrack_temp_files(state, cleanup_paths)
+        await state.clear()
+        await bot.send_message(chat_id, "\u274c Failed to update the password.\n\nPlease try again.")
+        await bot.send_message(chat_id, "\U0001F4C4 PDF Toolkit -- choose an operation:", reply_markup=get_pdf_menu())
+        return
+
+    await track_temp_file(state, output_path)
+    await _track_usage(user_repo, db_user)
+    cleanup_paths.append(output_path)
+
+    filename = data.get("rmpwd_filename", "document.pdf")
+
+    try:
+        await bot.send_document(chat_id, FSInputFile(output_path, filename=filename))
+        success_text = (
+            "\u2705 Password updated successfully!\n\n"
+            "\U0001F4C4 File\n"
+            f"{_escape_html(filename)}\n\n"
+            "\U0001F511 New Password\n"
+            f"<tg-spoiler><code>{_escape_html(new_password)}</code></tg-spoiler>\n\n"
+            "\u26a0\ufe0f Keep this password safe.\n\n"
+            "You'll need it to open the PDF."
+        )
+        await bot.send_message(chat_id, success_text, parse_mode="HTML")
+    finally:
+        if prompt_message_id is not None:
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=prompt_message_id)
+            except Exception as e:
+                logger.debug(f"Change Password: could not delete processing message: {e}")
+        delete_paths(cleanup_paths)
+        await untrack_temp_files(state, cleanup_paths)
+        await state.clear()
+
+    logger.info(f"Change Password: completed for chat {chat_id}")
+
+
+# --------------------------------------------------------------------------
+# Back (context-aware: Change Password's confirm step is the only screen
+# with a Back button; it returns to new-password entry and clears the
+# previously entered new password, matching the spec exactly)
+# --------------------------------------------------------------------------
+
+@router.callback_query(StateFilter(*_ALL_RMPWD_STATES), F.data == RMPWD_CB_BACK)
+async def pdf_remove_password_back(query: CallbackQuery, state: FSMContext):
+    await query.answer()
+    current = await state.get_state()
+    chat_id = query.message.chat.id
+
+    if current == RemovePasswordStates.waiting_for_confirm_new_password.state:
+        await state.update_data(rmpwd_new_password=None)
+        await state.set_state(RemovePasswordStates.waiting_for_new_password)
+        await _rmpwd_show(query.bot, state, chat_id, _render_rmpwd_change_prompt(), _rmpwd_cancel_only_keyboard())
+
+
+# --------------------------------------------------------------------------
+# Cancel -- available from every state, requires confirmation
+# --------------------------------------------------------------------------
+
+@router.callback_query(StateFilter(*_ALL_RMPWD_STATES), F.data == RMPWD_CB_CANCEL)
+async def pdf_remove_password_cancel(query: CallbackQuery, state: FSMContext):
+    await query.answer()
+    current = await state.get_state()
+    await state.update_data(rmpwd_pre_cancel_state=current)
+    await state.set_state(RemovePasswordStates.waiting_for_cancel_confirm)
+    await _rmpwd_show(query.bot, state, query.message.chat.id, _render_rmpwd_cancel_confirm_text(), _rmpwd_cancel_confirm_keyboard())
+
+
+@router.callback_query(RemovePasswordStates.waiting_for_cancel_confirm, F.data == RMPWD_CB_CANCEL_YES)
+async def pdf_remove_password_cancel_yes(query: CallbackQuery, state: FSMContext):
+    await query.answer()
+    await _rmpwd_full_cleanup(state)
+    await query.message.edit_text("\U0001F4C4 PDF Toolkit -- choose an operation:", reply_markup=get_pdf_menu())
+
+
+_RMPWD_SCREEN_RENDERERS = {
+    RemovePasswordStates.waiting_for_file.state: lambda d: (_render_rmpwd_upload_text(), _rmpwd_cancel_only_keyboard()),
+    RemovePasswordStates.waiting_for_password.state: lambda d: (_render_rmpwd_password_prompt(), _rmpwd_cancel_only_keyboard()),
+    RemovePasswordStates.waiting_for_unlocked_menu.state: lambda d: (_render_rmpwd_unlocked_text(), _rmpwd_unlocked_keyboard()),
+    RemovePasswordStates.waiting_for_new_password.state: lambda d: (_render_rmpwd_change_prompt(), _rmpwd_cancel_only_keyboard()),
+    RemovePasswordStates.waiting_for_confirm_new_password.state: lambda d: (_render_rmpwd_confirm_new_text(), _rmpwd_back_cancel_keyboard()),
+}
+
+
+@router.callback_query(RemovePasswordStates.waiting_for_cancel_confirm, F.data == RMPWD_CB_CANCEL_NO)
+async def pdf_remove_password_cancel_no(query: CallbackQuery, state: FSMContext):
+    await query.answer()
+    data = await state.get_data()
+    prev_state = data.get("rmpwd_pre_cancel_state") or RemovePasswordStates.waiting_for_file.state
+    renderer = _RMPWD_SCREEN_RENDERERS.get(prev_state, _RMPWD_SCREEN_RENDERERS[RemovePasswordStates.waiting_for_file.state])
+    await state.set_state(prev_state)
+    text, keyboard = renderer(data)
+    await _rmpwd_show(query.bot, state, query.message.chat.id, text, keyboard)
