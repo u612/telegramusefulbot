@@ -260,6 +260,7 @@ def _render_password_prompt() -> str:
 def _render_confirm_text(password: str) -> str:
     return (
         "Confirm your password.\n\n"
+        "Please enter your password again.\n\n"
         "\U0001F4AA Strength\n"
         f"{_strength_line(password)}"
     )
