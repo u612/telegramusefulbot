@@ -34,6 +34,7 @@ from utils.tempfiles import (
 )
 from utils.validators import validate_extension, validate_upload, sanitize_filename
 
+from utils.session_manager import register_stale_callbacks
 from .common import (
     _PDF_MIME,
     _QUEUE_DIVIDER,
@@ -1068,7 +1069,7 @@ async def pdf_merge_cancel_no(query: CallbackQuery, state: FSMContext):
 # pressed in the brief window before the edit lands).
 # --------------------------------------------------------------------------
 
-_MERGE_ALL_CALLBACKS = {
+register_stale_callbacks(exact={
     PDF_DONE,
     MERGE_CB_CANCEL,
     MERGE_CB_CANCEL_YES,
@@ -1077,15 +1078,6 @@ _MERGE_ALL_CALLBACKS = {
     MERGE_CB_CONFIRM,
     MERGE_CB_REARRANGE_AGAIN,
     MERGE_CB_ADD_MORE,
-}
-
-
-@router.callback_query(StateFilter(None), F.data.in_(_MERGE_ALL_CALLBACKS))
-async def pdf_merge_stale_callback(query: CallbackQuery):
-    await query.answer("This session has expired. Please start again from the menu.", show_alert=True)
-    try:
-        await query.message.edit_reply_markup(reply_markup=None)
-    except Exception as e:
-        logger.debug(f"Merge: could not strip keyboard from stale callback message: {e}")
+})
 
 
