@@ -24,6 +24,7 @@ from services.pdf._common import PDFProcessingError, open_pdf_reader, check_page
 from utils.tempfiles import track_temp_file, untrack_temp_files, get_tracked_files, delete_paths
 from utils.validators import validate_extension
 
+from utils.session_manager import register_stale_callbacks
 from .common import (
     _PDF_MIME,
     _QUEUE_DIVIDER,
@@ -755,18 +756,9 @@ async def pdf_compress_cancel_no(query: CallbackQuery, state: FSMContext):
 # Stale-button safety net -- same rationale as Merge/Split's.
 # --------------------------------------------------------------------------
 
-_COMPRESS_ALL_CALLBACKS = {
+register_stale_callbacks(exact={
     COMPRESS_CB_METHOD_BEST, COMPRESS_CB_METHOD_BALANCED, COMPRESS_CB_METHOD_MAXIMUM,
     COMPRESS_CB_METHOD_TARGET, COMPRESS_CB_BACK_TO_METHOD, COMPRESS_CB_CANCEL,
     COMPRESS_CB_CANCEL_YES, COMPRESS_CB_CANCEL_NO, COMPRESS_CB_CONFIRM,
     COMPRESS_CB_CHANGE_MODE, COMPRESS_CB_CONFIRM_TARGET, COMPRESS_CB_CHANGE_SIZE,
-}
-
-
-@router.callback_query(StateFilter(None), F.data.in_(_COMPRESS_ALL_CALLBACKS))
-async def pdf_compress_stale_callback(query: CallbackQuery):
-    await query.answer("This session has expired. Please start again from the menu.", show_alert=True)
-    try:
-        await query.message.edit_reply_markup(reply_markup=None)
-    except Exception as e:
-        logger.debug(f"Compress: could not strip keyboard from stale callback message: {e}")
+})
