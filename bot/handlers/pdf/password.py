@@ -955,7 +955,7 @@ def _render_rmpwd_change_prompt() -> str:
 
 
 def _render_rmpwd_confirm_new_text() -> str:
-    return "Confirm your new password.\n\nPlease Re-enter a new password."
+    return "Confirm your new password.\n\nPlease Re-enter your new password."
 
 
 def _render_rmpwd_cancel_confirm_text() -> str:
