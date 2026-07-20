@@ -11,6 +11,7 @@ anything.
 Engine: PyMuPDF (fitz) only -- see services.pdf.watermark.
 """
 import asyncio
+from typing import Dict, List
 
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, FSInputFile
@@ -20,7 +21,7 @@ from aiogram.filters import StateFilter
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.keyboards.pdf import get_pdf_menu, PDF_WATERMARK
-from core.constants import SUPPORTED_PDF_EXTS
+from core.constants import SUPPORTED_PDF_EXTS, MERGE_BATCH_FINALIZE_DELAY_SECONDS
 from core.logger import logger
 
 from services.pdf._common import PDFProcessingError, open_pdf_reader
@@ -113,6 +114,12 @@ WM_CB_APPLY = "pdfwm:apply"
 
 _IMAGE_WM_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 _IMAGE_WM_MIMES = {"image/png", "image/jpeg", "image/webp"}
+
+# Buffers for the case a PDF arrives as part of a Telegram media group
+# (album) -- Watermark only ever accepts ONE PDF, so a whole album must be
+# rejected as a unit. Mirrors Rearrange's buffer-then-debounce approach.
+_wm_pending_groups: Dict[str, List[Message]] = {}
+_wm_group_tasks: Dict[str, "asyncio.Task"] = {}
 
 _POSITION_LABELS = {
     "center": "Center",
@@ -409,6 +416,17 @@ async def _full_cleanup(state: FSMContext) -> None:
     await state.clear()
 
 
+def _watermarked_filename(name: str) -> str:
+    """Apply the project's `_suffix` naming convention: insert `_wm`
+    before the final extension (e.g. Report.pdf -> Report_wm.pdf,
+    invoice.v2.final.pdf -> invoice.v2.final_wm.pdf).
+    """
+    stem, dot, ext = (name or "document.pdf").rpartition(".")
+    if not dot:
+        return f"{name}_wm.pdf"
+    return f"{stem}_wm.{ext}"
+
+
 # --------------------------------------------------------------------------
 # Step 1: entry + PDF upload
 # --------------------------------------------------------------------------
@@ -423,8 +441,7 @@ async def pdf_watermark_start(query: CallbackQuery, state: FSMContext):
     await query.answer()
 
 
-@router.message(WatermarkStates.waiting_for_file, F.document)
-async def pdf_watermark_receive_pdf(message: Message, state: FSMContext, db_user=None):
+async def _process_single_wm_pdf(message: Message, state: FSMContext, db_user=None) -> None:
     doc = message.document
     if not validate_extension(doc.file_name or "", SUPPORTED_PDF_EXTS):
         await _delete_message_silently(message)
@@ -451,6 +468,44 @@ async def pdf_watermark_receive_pdf(message: Message, state: FSMContext, db_user
     await state.update_data(wm_input_path=path, wm_filename=doc.file_name or "document.pdf")
     await state.set_state(WatermarkStates.waiting_for_type)
     await _show(message.bot, state, message.chat.id, _render_type_text(), _type_keyboard())
+
+
+async def _finalize_wm_media_group(key: str, state: FSMContext, db_user) -> None:
+    try:
+        await asyncio.sleep(MERGE_BATCH_FINALIZE_DELAY_SECONDS)
+    except asyncio.CancelledError:
+        return
+    group = _wm_pending_groups.pop(key, None)
+    _wm_group_tasks.pop(key, None)
+    if not group:
+        return
+    if await state.get_state() != WatermarkStates.waiting_for_file.state:
+        return  # user navigated away while the album was still arriving
+
+    if len(group) > 1:
+        for m in group:
+            await _delete_message_silently(m)
+        await _send_temp_validation_error(group[0].bot, group[0].chat.id, "❌ Please send only one PDF.")
+        return
+
+    await _process_single_wm_pdf(group[0], state, db_user=db_user)
+
+
+@router.message(WatermarkStates.waiting_for_file, F.document)
+async def pdf_watermark_receive_pdf(message: Message, state: FSMContext, db_user=None):
+    if message.media_group_id:
+        key = f"{message.chat.id}:{message.media_group_id}"
+        group = _wm_pending_groups.setdefault(key, [])
+        group.append(message)
+        old_task = _wm_group_tasks.get(key)
+        if old_task and not old_task.done():
+            old_task.cancel()
+        _wm_group_tasks[key] = asyncio.create_task(
+            _finalize_wm_media_group(key, state, db_user)
+        )
+        return
+
+    await _process_single_wm_pdf(message, state, db_user=db_user)
 
 
 @router.message(WatermarkStates.waiting_for_file)
@@ -489,11 +544,11 @@ async def pdf_watermark_text_received(message: Message, state: FSMContext):
     await _delete_message_silently(message)
 
     if not text:
-        await _send_temp_validation_error(message.bot, message.chat.id, "❌ Please send text only.")
+        await _send_temp_validation_error(message.bot, message.chat.id, "❌ Watermark text cannot be empty.")
         return
     if len(text) > 100:
         await _send_temp_validation_error(
-            message.bot, message.chat.id, "❌ Watermark text is too long (max 100 characters)."
+            message.bot, message.chat.id, "❌ Watermark text is too long.\n\nMaximum 100 characters."
         )
         return
 
@@ -790,10 +845,18 @@ async def pdf_watermark_apply(query: CallbackQuery, state: FSMContext, user_repo
         await query.bot.send_message(chat_id, "📄 PDF Toolkit -- choose an operation:", reply_markup=get_pdf_menu())
         return
 
-    # Edit current message, disable buttons, prevent duplicate clicks.
+    if data.get("wm_applying"):
+        # Duplicate Apply press (e.g. a second tap that reached the server
+        # before the keyboard removal below took effect) -- ignore it.
+        return
+    await state.update_data(wm_applying=True)
+
+    # Edit current message, explicitly drop the keyboard so it can never be
+    # pressed again, and prevent duplicate clicks/processing.
     try:
         await query.bot.edit_message_text(
             "⏳ Applying watermark...", chat_id=chat_id, message_id=query.message.message_id,
+            reply_markup=None,
         )
     except Exception as e:
         logger.debug(f"Watermark: could not edit to processing state: {e}")
@@ -842,7 +905,7 @@ async def pdf_watermark_apply(query: CallbackQuery, state: FSMContext, user_repo
     cleanup_paths.append(output_path)
 
     filename = data.get("wm_filename", "document.pdf")
-    output_filename = f"watermarked_{filename}"
+    output_filename = _watermarked_filename(filename)
 
     try:
         await query.bot.send_document(chat_id, FSInputFile(output_path, filename=output_filename))
@@ -1004,6 +1067,33 @@ async def pdf_watermark_cancel_no(query: CallbackQuery, state: FSMContext):
     await state.set_state(prev_state)
     text, keyboard = renderer(data)
     await _show(query.bot, state, query.message.chat.id, text, keyboard)
+
+
+# --------------------------------------------------------------------------
+# Button-only screens: Type, Position, Rotation, Opacity, Size, Summary
+# (both branches) and the Cancel-confirm screen only ever expect an inline
+# button press. Any other message received there is discarded silently --
+# no validation error, no state change, screen stays exactly as it is.
+# --------------------------------------------------------------------------
+
+_BUTTON_ONLY_STATES = (
+    WatermarkStates.waiting_for_type,
+    WatermarkStates.waiting_for_position,
+    WatermarkStates.waiting_for_rotation,
+    WatermarkStates.waiting_for_opacity,
+    WatermarkStates.waiting_for_size,
+    WatermarkStates.waiting_for_summary,
+    WatermarkStates.waiting_for_image_position,
+    WatermarkStates.waiting_for_image_size,
+    WatermarkStates.waiting_for_image_opacity,
+    WatermarkStates.waiting_for_image_summary,
+    WatermarkStates.waiting_for_cancel_confirm,
+)
+
+
+@router.message(StateFilter(*_BUTTON_ONLY_STATES))
+async def pdf_watermark_button_only_screen_message(message: Message):
+    await _delete_message_silently(message)
 
 
 # --------------------------------------------------------------------------
