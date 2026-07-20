@@ -552,8 +552,20 @@ async def _process_single_wm_pdf(message: Message, state: FSMContext, db_user=No
 
     await state.update_data(wm_input_path=path, wm_filename=doc.file_name or "document.pdf")
     await state.set_state(WatermarkStates.waiting_for_type)
+
+    # Remove the initial upload prompt -- the uploaded PDF stays, but the
+    # "Please send the PDF." message must not linger, matching Rotate/
+    # Split/Compress/etc's clean-chat UX.
+    data = await state.get_data()
+    old_prompt_id = data.get("wm_prompt_message_id")
+    if old_prompt_id is not None:
+        try:
+            await message.bot.delete_message(chat_id=message.chat.id, message_id=old_prompt_id)
+        except Exception as e:
+            logger.debug(f"Watermark: could not delete initial upload prompt: {e}")
+
     # Send as a NEW message rather than editing the original upload prompt --
-    # matches Rotate/Split/Compress/etc: the upload prompt stays as-is, and
+    # matches Rotate/Split/Compress/etc: the upload prompt is removed, and
     # this new message (appearing below the user's PDF) becomes the single
     # message the rest of the flow edits in place.
     sent = await message.answer(_render_type_text(), reply_markup=_type_keyboard())
