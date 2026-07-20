@@ -30,10 +30,46 @@ POSITIONS = {
     "center", "top_left", "top_right", "bottom_left", "bottom_right",
     "header", "footer",
 }
-TEXT_ROTATIONS = {"diagonal": 45, "horizontal": 0, "vertical": 90}
+TEXT_ROTATIONS = {"diagonal": 45, "reverse_diagonal": -45, "horizontal": 0, "vertical": 90}
 OPACITIES = {10: 0.10, 25: 0.25, 50: 0.50, 75: 0.75, 100: 1.0}
 TEXT_SIZES = {"small", "medium", "large", "auto"}
 IMAGE_SIZES = {"small", "medium", "large", "original"}
+
+# Predefined text-watermark colors (RGB, 0-1 floats per channel -- PyMuPDF
+# convention). Kept muted/legible rather than pure primaries so the
+# watermark stays readable at any opacity.
+TEXT_COLORS = {
+    "black": (0.0, 0.0, 0.0),
+    "white": (1.0, 1.0, 1.0),
+    "red": (0.80, 0.10, 0.10),
+    "blue": (0.10, 0.30, 0.80),
+    "green": (0.10, 0.55, 0.20),
+    "yellow": (0.85, 0.75, 0.10),
+    "purple": (0.50, 0.15, 0.60),
+    "orange": (0.90, 0.50, 0.10),
+    "brown": (0.50, 0.30, 0.10),
+    "pink": (0.95, 0.55, 0.65),
+}
+
+# Predefined text-watermark styles, mapped to PyMuPDF's built-in base-14
+# Helvetica font names.
+TEXT_STYLES = {
+    "normal": "helv",
+    "bold": "hebo",
+    "italic": "heit",
+    "bold_italic": "hebi",
+}
+
+
+def _opacity_fraction(opacity_pct: int) -> float:
+    """Validate and convert a 1-100 opacity percentage to a 0-1 fraction.
+    Replaces the old fixed OPACITIES lookup so any value in range
+    (including the new custom-opacity input) is accepted, not just the
+    five preset percentages.
+    """
+    if not isinstance(opacity_pct, int) or isinstance(opacity_pct, bool) or not (1 <= opacity_pct <= 100):
+        raise PDFProcessingError("Invalid watermark opacity.")
+    return opacity_pct / 100.0
 
 
 def _margin(width: float, height: float) -> float:
@@ -87,12 +123,13 @@ def _text_fontsize(width: float, height: float, size: str, text: str) -> float:
 
 
 def _draw_text_watermark(page: "fitz.Page", text: str, position: str, rotation_deg: int,
-                          opacity: float, fontsize: float) -> None:
+                          opacity: float, fontsize: float, color: Tuple[float, float, float],
+                          fontname: str) -> None:
     rect = page.rect
     width, height = rect.width, rect.height
     x, y, halign = _anchor_point(position, width, height)
 
-    text_width = fitz.get_text_length(text, fontname="helv", fontsize=fontsize)
+    text_width = fitz.get_text_length(text, fontname=fontname, fontsize=fontsize)
     if halign == "center":
         origin_x = x - text_width / 2
     elif halign == "right":
@@ -109,9 +146,9 @@ def _draw_text_watermark(page: "fitz.Page", text: str, position: str, rotation_d
     shape.insert_text(
         point,
         text,
-        fontname="helv",
+        fontname=fontname,
         fontsize=fontsize,
-        color=(0.45, 0.45, 0.45),
+        color=color,
         fill_opacity=opacity,
         morph=(pivot, matrix),
     )
@@ -119,25 +156,31 @@ def _draw_text_watermark(page: "fitz.Page", text: str, position: str, rotation_d
 
 
 def _watermark_text_sync(input_path: str, text: str, position: str, rotation: str,
-                          opacity_pct: int, size: str) -> str:
+                          opacity_pct: int, size: str, color: str = "black",
+                          style: str = "normal") -> str:
     if position not in POSITIONS:
         raise PDFProcessingError("Invalid watermark position.")
     if rotation not in TEXT_ROTATIONS:
         raise PDFProcessingError("Invalid watermark rotation.")
-    if opacity_pct not in OPACITIES:
-        raise PDFProcessingError("Invalid watermark opacity.")
     if size not in TEXT_SIZES:
         raise PDFProcessingError("Invalid watermark size.")
+    if color not in TEXT_COLORS:
+        raise PDFProcessingError("Invalid watermark color.")
+    if style not in TEXT_STYLES:
+        raise PDFProcessingError("Invalid watermark style.")
+
+    opacity = _opacity_fraction(opacity_pct)
 
     doc = fitz.open(input_path)
     try:
         if doc.page_count == 0:
             raise PDFProcessingError("PDF must have at least 1 page(s).")
         rotation_deg = TEXT_ROTATIONS[rotation]
-        opacity = OPACITIES[opacity_pct]
+        rgb = TEXT_COLORS[color]
+        fontname = TEXT_STYLES[style]
         for page in doc:
             fontsize = _text_fontsize(page.rect.width, page.rect.height, size, text)
-            _draw_text_watermark(page, text, position, rotation_deg, opacity, fontsize)
+            _draw_text_watermark(page, text, position, rotation_deg, opacity, fontsize, rgb, fontname)
 
         output_path = new_temp_path(suffix=".pdf")
         doc.save(output_path)
@@ -232,10 +275,8 @@ def _watermark_image_sync(input_path: str, image_path: str, position: str, size:
         raise PDFProcessingError("Invalid watermark position.")
     if size not in IMAGE_SIZES:
         raise PDFProcessingError("Invalid watermark size.")
-    if opacity_pct not in OPACITIES:
-        raise PDFProcessingError("Invalid watermark opacity.")
 
-    prepared_image = _prepare_watermark_image(image_path, OPACITIES[opacity_pct])
+    prepared_image = _prepare_watermark_image(image_path, _opacity_fraction(opacity_pct))
     doc = None
     try:
         doc = fitz.open(input_path)
@@ -265,14 +306,15 @@ def _watermark_image_sync(input_path: str, image_path: str, position: str, size:
 
 class PDFWatermark:
     async def add_text_watermark(self, input_path: str, text: str, position: str,
-                                  rotation: str, opacity_pct: int, size: str) -> str:
+                                  rotation: str, opacity_pct: int, size: str,
+                                  color: str = "black", style: str = "normal") -> str:
         text = (text or "").strip()
         if not text:
             raise PDFProcessingError("Watermark text can't be empty.")
         if len(text) > MAX_WATERMARK_TEXT_LEN:
             raise PDFProcessingError(f"Watermark text is too long (max {MAX_WATERMARK_TEXT_LEN} characters).")
         return await asyncio.to_thread(
-            _watermark_text_sync, input_path, text, position, rotation, opacity_pct, size
+            _watermark_text_sync, input_path, text, position, rotation, opacity_pct, size, color, style
         )
 
     async def add_image_watermark(self, input_path: str, image_path: str, position: str,
