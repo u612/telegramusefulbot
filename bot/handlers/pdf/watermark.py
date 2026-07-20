@@ -236,8 +236,8 @@ def _position_keyboard():
 
 def _rotation_keyboard():
     b = InlineKeyboardBuilder()
-    b.button(text="╱ Diagonal", callback_data=f"{WM_CB_ROT_PREFIX}diagonal")
-    b.button(text="╲ Reverse Diagonal", callback_data=f"{WM_CB_ROT_PREFIX}reverse_diagonal")
+    b.button(text="╲ Diagonal", callback_data=f"{WM_CB_ROT_PREFIX}diagonal")
+    b.button(text="╱ Reverse Diagonal", callback_data=f"{WM_CB_ROT_PREFIX}reverse_diagonal")
     b.button(text="─ Horizontal", callback_data=f"{WM_CB_ROT_PREFIX}horizontal")
     b.button(text="│ Vertical", callback_data=f"{WM_CB_ROT_PREFIX}vertical")
     b.button(text="↩ Back", callback_data=WM_CB_BACK)
