@@ -25,6 +25,7 @@ from services.pdf._common import PDFProcessingError, open_pdf_reader, check_page
 from utils.tempfiles import track_temp_file, untrack_temp_files, get_tracked_files, delete_paths
 from utils.validators import validate_extension
 
+from utils.session_manager import register_stale_callbacks
 from .common import (
     _PDF_MIME,
     _QUEUE_DIVIDER,
@@ -985,20 +986,11 @@ async def pdf_split_cancel_no(query: CallbackQuery, state: FSMContext):
 # forever with no reply when pressed.
 # --------------------------------------------------------------------------
 
-_SPLIT_ALL_CALLBACKS = {
+register_stale_callbacks(exact={
     SPLIT_CB_METHOD_RANGE, SPLIT_CB_METHOD_EXTRACT, SPLIT_CB_METHOD_EVERY,
     SPLIT_CB_BACK_TO_METHOD, SPLIT_CB_CANCEL, SPLIT_CB_CANCEL_YES, SPLIT_CB_CANCEL_NO,
     SPLIT_CB_CONFIRM_RANGE, SPLIT_CB_CHANGE_RANGE, SPLIT_CB_CONFIRM_EXTRACT,
     SPLIT_CB_CHANGE_PAGES, SPLIT_CB_CONFIRM_EVERY, SPLIT_CB_LARGE_CONTINUE,
-}
-
-
-@router.callback_query(StateFilter(None), F.data.in_(_SPLIT_ALL_CALLBACKS))
-async def pdf_split_stale_callback(query: CallbackQuery):
-    await query.answer("This session has expired. Please start again from the menu.", show_alert=True)
-    try:
-        await query.message.edit_reply_markup(reply_markup=None)
-    except Exception as e:
-        logger.debug(f"Split: could not strip keyboard from stale callback message: {e}")
+})
 
 
