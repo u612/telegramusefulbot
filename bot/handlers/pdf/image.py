@@ -7,10 +7,13 @@ identically across the toolkit.
 PDF -> Images: choose an output format first, then upload the PDF.
 """
 import asyncio
+import time
 from typing import Dict, List, Optional
 
 from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery, FSInputFile
+from aiogram.types import (
+    Message, CallbackQuery, FSInputFile, InputMediaPhoto, InputMediaDocument,
+)
 from aiogram.fsm.context import FSMContext
 from aiogram.filters import StateFilter
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -19,7 +22,7 @@ from PIL import Image, UnidentifiedImageError
 from bot.states.pdf import PDFStates
 from bot.keyboards.pdf import (
     PDF_IMAGE_TO_PDF, PDF_PDF_TO_IMAGES, PDF_DONE,
-    get_pdf_menu, pdf_to_images_format_keyboard,
+    get_pdf_menu,
     PDF_TO_IMG_PNG, PDF_TO_IMG_JPEG,
 )
 from bot.keyboards.common import back_home_cancel
@@ -29,7 +32,9 @@ from utils.limits import get_effective_limits
 from utils.session_manager import register_stale_callbacks
 
 from services.pdf.image_to_pdf import ImageToPDF
-from services.pdf.pdf_to_images import PDFToImages
+from services.pdf.pdf_to_images import (
+    PDFToImages, DPI_STANDARD, DPI_HIGH, DPI_MAXIMUM,
+)
 from services.pdf._common import PDFProcessingError
 
 from utils.tempfiles import (
@@ -40,7 +45,7 @@ from utils.validators import validate_extension, validate_file_size, sanitize_fi
 
 from .common import (
     _PDF_MIME, _download_and_validate, _fail, _track_usage,
-    _finish_with_documents, _send_temp_validation_error,
+    _send_temp_validation_error,
 )
 
 router = Router()
@@ -825,13 +830,306 @@ register_stale_callbacks(prefix="img2pdf:")
 # PDF -> Images (choose format first, then upload)
 # --------------------------------------------------------------------------
 
+P2I_CB_BACK_TO_FORMAT = "pdf_p2i_back_fmt"
+P2I_CB_BACK_TO_QUALITY = "pdf_p2i_back_qual"
+P2I_CB_BACK_TO_PAGES = "pdf_p2i_back_pages"
+
+P2I_CB_DPI_STD = "pdf_p2i_dpi_std"
+P2I_CB_DPI_HIGH = "pdf_p2i_dpi_high"
+P2I_CB_DPI_MAX = "pdf_p2i_dpi_max"
+
+P2I_CB_ALL_PAGES = "pdf_p2i_all_pages"
+P2I_CB_CUSTOM_PAGES = "pdf_p2i_custom_pages"
+P2I_CB_EDIT_PAGES = "pdf_p2i_edit_pages"
+P2I_CB_CONVERT = "pdf_p2i_convert"
+
+P2I_CB_CANCEL = "pdf_p2i_cancel"
+P2I_CB_CANCEL_YES = "pdf_p2i_cancel_yes"
+P2I_CB_CANCEL_NO = "pdf_p2i_cancel_no"
+
+_P2I_DPI_LABELS = {DPI_STANDARD: "Standard", DPI_HIGH: "High", DPI_MAXIMUM: "Maximum"}
+_P2I_DPI_BY_CB = {P2I_CB_DPI_STD: DPI_STANDARD, P2I_CB_DPI_HIGH: DPI_HIGH, P2I_CB_DPI_MAX: DPI_MAXIMUM}
+
+_P2I_LARGE_OUTPUT_THRESHOLD = 20
+_P2I_ALBUM_SIZE = 10
+_P2I_ALBUM_DELAY_SECONDS = 0.8
+_P2I_PROGRESS_EDIT_INTERVAL_SECONDS = 2.0
+
+_P2I_CANCELABLE_STATES = (
+    PDFStates.waiting_for_format_pdf_to_images,
+    PDFStates.waiting_for_quality_pdf_to_images,
+    PDFStates.waiting_for_file_pdf_to_images,
+    PDFStates.waiting_for_pages_pdf_to_images,
+    PDFStates.waiting_for_custom_pages_pdf_to_images,
+    PDFStates.waiting_for_ready_pdf_to_images,
+)
+
+# A PDF might arrive as part of a Telegram media group -- PDF -> Images only
+# ever accepts ONE PDF, so a whole album must be rejected as a unit rather
+# than silently taking the first file. Mirrors Split's buffer-then-debounce
+# approach (see split.py's `_split_pending_groups`).
+_p2i_pending_groups: Dict[str, List[Message]] = {}
+_p2i_group_tasks: Dict[str, asyncio.Task] = {}
+
+
+# --------------------------------------------------------------------------
+# Rendering
+# --------------------------------------------------------------------------
+
+def _p2i_format_keyboard():
+    b = InlineKeyboardBuilder()
+    b.button(text="🖼 PNG", callback_data=PDF_TO_IMG_PNG)
+    b.button(text="📷 JPG", callback_data=PDF_TO_IMG_JPEG)
+    b.button(text="❌ Cancel", callback_data=P2I_CB_CANCEL)
+    b.adjust(1)
+    return b.as_markup()
+
+
+def _p2i_quality_keyboard():
+    b = InlineKeyboardBuilder()
+    b.button(text="⭐ Standard · 150 DPI", callback_data=P2I_CB_DPI_STD)
+    b.button(text="⭐⭐ High · 300 DPI (Recommended)", callback_data=P2I_CB_DPI_HIGH)
+    b.button(text="⭐⭐⭐ Maximum · 600 DPI", callback_data=P2I_CB_DPI_MAX)
+    b.button(text="⬅️ Back", callback_data=P2I_CB_BACK_TO_FORMAT)
+    b.button(text="❌ Cancel", callback_data=P2I_CB_CANCEL)
+    b.adjust(1, 1, 1, 2)
+    return b.as_markup()
+
+
+def _p2i_upload_keyboard():
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ Back", callback_data=P2I_CB_BACK_TO_QUALITY)
+    b.button(text="❌ Cancel", callback_data=P2I_CB_CANCEL)
+    b.adjust(2)
+    return b.as_markup()
+
+
+def _p2i_choose_pages_keyboard():
+    b = InlineKeyboardBuilder()
+    b.button(text="📄 All Pages", callback_data=P2I_CB_ALL_PAGES)
+    b.button(text="✏️ Custom Pages", callback_data=P2I_CB_CUSTOM_PAGES)
+    b.button(text="❌ Cancel", callback_data=P2I_CB_CANCEL)
+    b.adjust(1)
+    return b.as_markup()
+
+
+def _p2i_custom_pages_keyboard():
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ Back", callback_data=P2I_CB_BACK_TO_PAGES)
+    b.button(text="❌ Cancel", callback_data=P2I_CB_CANCEL)
+    b.adjust(2)
+    return b.as_markup()
+
+
+def _p2i_ready_keyboard():
+    b = InlineKeyboardBuilder()
+    b.button(text="📸 Convert", callback_data=P2I_CB_CONVERT)
+    b.button(text="✏️ Edit Pages", callback_data=P2I_CB_EDIT_PAGES)
+    b.button(text="❌ Cancel", callback_data=P2I_CB_CANCEL)
+    b.adjust(1)
+    return b.as_markup()
+
+
+def _p2i_cancel_confirm_keyboard():
+    b = InlineKeyboardBuilder()
+    b.button(text="✅ Yes, Cancel", callback_data=P2I_CB_CANCEL_YES)
+    b.button(text="↩ Continue", callback_data=P2I_CB_CANCEL_NO)
+    b.adjust(2)
+    return b.as_markup()
+
+
+def _p2i_format_label(fmt: str) -> str:
+    return "PNG" if fmt == "png" else "JPG"
+
+
+def _p2i_welcome_text() -> str:
+    return (
+        "📸 PDF to Images\n\n"
+        "Convert PDF pages into high-quality images.\n\n"
+        "Choose your preferred output format."
+    )
+
+
+def _p2i_quality_text(fmt: str) -> str:
+    return (
+        "📸 PDF to Images\n\n"
+        f"🖼 Output Format\n\n{_p2i_format_label(fmt)}\n\n"
+        "⭐ Image Quality\n\n"
+        "Higher quality produces sharper images but increases file size and conversion time.\n\n"
+        "Choose the quality you'd like."
+    )
+
+
+def _p2i_upload_text(fmt: str, dpi: int) -> str:
+    return (
+        "📸 PDF to Images\n\n"
+        f"🖼 Output Format\n\n{_p2i_format_label(fmt)}\n\n"
+        f"⭐ Image Quality\n\n{dpi} DPI\n\n"
+        "Send the PDF you want to convert."
+    )
+
+
+def _p2i_choose_pages_text(total_pages: int) -> str:
+    return (
+        "📸 PDF Ready\n\n"
+        f"📄 Total Pages\n\n{total_pages}\n\n"
+        "Choose which pages you'd like to convert."
+    )
+
+
+def _p2i_custom_pages_prompt_text() -> str:
+    return (
+        "✏️ Custom Pages\n\n"
+        "Enter the pages you want to convert.\n\n"
+        "Examples\n\n"
+        "1\n"
+        "1-5\n"
+        "1,3,8\n"
+        "1-5,8,10-15"
+    )
+
+
+def _p2i_ready_text(data: dict, pages: List[int]) -> str:
+    return (
+        "📸 PDF Ready\n\n"
+        f"📄 Total Pages\n\n{data.get('p2i_page_count', 0)}\n\n"
+        f"📑 Selected Pages\n\n{data.get('p2i_pages_label', str(len(pages)))}\n\n"
+        f"🖼 Output Format\n\n{_p2i_format_label(data.get('p2i_format', 'png'))}\n\n"
+        f"⭐ Image Quality\n\n{data.get('p2i_dpi', DPI_HIGH)} DPI\n\n"
+        "Review your settings before converting."
+    )
+
+
+def _p2i_progress_bar(done: int, total: int, width: int = 18) -> str:
+    filled = int((done / total) * width) if total else 0
+    return "█" * filled + "░" * (width - filled)
+
+
+def _p2i_sending_progress_text(
+    done_albums: int, total_albums: int, est_remaining_seconds: float, pages_range: Optional[str] = None
+) -> str:
+    pct = int((done_albums / total_albums) * 100) if total_albums else 0
+    bar = _p2i_progress_bar(done_albums, total_albums)
+    eta = "Almost done..." if est_remaining_seconds < 3 else f"~{int(round(est_remaining_seconds))} seconds"
+    lines = [
+        "📤 Sending Images...", "",
+        bar, "",
+        f"Progress\n\n{pct}%", "",
+        f"Albums\n\n{done_albums} / {total_albums}",
+    ]
+    if pages_range:
+        lines += ["", f"Pages\n\n{pages_range}"]
+    lines += ["", f"ETA\n\n{eta}"]
+    return "\n".join(lines)
+
+
+def _format_p2i_page_ranges(pages: List[int]) -> str:
+    """Compact 1-indexed page list -> ranges, e.g. [1,2,3,8] -> '1-3,8'."""
+    if not pages:
+        return ""
+    parts = []
+    start = prev = pages[0]
+    for p in pages[1:]:
+        if p == prev + 1:
+            prev = p
+            continue
+        parts.append(f"{start}-{prev}" if start != prev else f"{start}")
+        start = prev = p
+    parts.append(f"{start}-{prev}" if start != prev else f"{start}")
+    return ",".join(parts)
+
+
+def _parse_p2i_pages(spec: str, total_pages: int) -> List[int]:
+    """Parse a comma-separated page/range spec (e.g. '1-5,8,10-15') into a
+    sorted, deduplicated list of 1-indexed page numbers. Raises ValueError
+    with a user-facing message on any problem.
+    """
+    tokens = [t.strip() for t in spec.split(",") if t.strip() != ""]
+    if not tokens:
+        raise ValueError("Please enter at least one page.")
+
+    pages: set = set()
+    for tok in tokens:
+        if "-" in tok:
+            bounds = tok.split("-")
+            if len(bounds) != 2:
+                raise ValueError(
+                    "Invalid page selection.\n\nExamples:\n\n1\n1-5\n1,3,7\n1-5,8,10-12"
+                )
+            try:
+                start, end = int(bounds[0]), int(bounds[1])
+            except ValueError:
+                raise ValueError(
+                    "Invalid page selection.\n\nExamples:\n\n1\n1-5\n1,3,7\n1-5,8,10-12"
+                )
+            if start < 1 or end < 1 or start > end:
+                raise ValueError(
+                    "Invalid page selection.\n\nExamples:\n\n1\n1-5\n1,3,7\n1-5,8,10-12"
+                )
+            if start > total_pages or end > total_pages:
+                raise ValueError(f"Some pages don't exist.\n\nThis PDF contains {total_pages} pages.")
+            pages.update(range(start, end + 1))
+        else:
+            try:
+                p = int(tok)
+            except ValueError:
+                raise ValueError(
+                    "Invalid page selection.\n\nExamples:\n\n1\n1-5\n1,3,7\n1-5,8,10-12"
+                )
+            if p < 1:
+                raise ValueError(
+                    "Invalid page selection.\n\nExamples:\n\n1\n1-5\n1,3,7\n1-5,8,10-12"
+                )
+            if p > total_pages:
+                raise ValueError(f"Some pages don't exist.\n\nThis PDF contains {total_pages} pages.")
+            pages.add(p)
+
+    if not pages:
+        raise ValueError("Please enter at least one page.")
+    return sorted(pages)
+
+
+async def _edit_p2i_message(bot, state: FSMContext, text: str, keyboard=None) -> None:
+    """Edit the single, reused PDF -> Images workflow message in place.
+    This tool keeps exactly one workflow message alive for its whole
+    lifetime (per spec) -- everything from the welcome screen through to
+    the sending-progress screen edits this same message.
+    """
+    data = await state.get_data()
+    chat_id = data.get("p2i_status_chat_id")
+    message_id = data.get("p2i_status_message_id")
+    if chat_id is None or message_id is None:
+        return
+    try:
+        await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=keyboard)
+    except Exception as e:
+        logger.debug(f"PDF->Images: workflow message edit skipped: {e}")
+
+
+async def _p2i_full_cleanup(state: FSMContext, chat_id: int) -> None:
+    for key in [k for k in _p2i_pending_groups if k.startswith(f"{chat_id}:")]:
+        _p2i_pending_groups.pop(key, None)
+        task = _p2i_group_tasks.pop(key, None)
+        if task and not task.done():
+            task.cancel()
+    files = await get_tracked_files(state)
+    if files:
+        delete_paths(files)
+        await untrack_temp_files(state, files)
+    await state.clear()
+
+
+# --------------------------------------------------------------------------
+# Step 1: Welcome / output format
+# --------------------------------------------------------------------------
 
 @router.callback_query(F.data == PDF_PDF_TO_IMAGES)
 async def pdf_to_images_start(query: CallbackQuery, state: FSMContext):
     await state.set_state(PDFStates.waiting_for_format_pdf_to_images)
-    await query.message.edit_text(
-        "Choose an output image format:",
-        reply_markup=pdf_to_images_format_keyboard(),
+    await query.message.edit_text(_p2i_welcome_text(), reply_markup=_p2i_format_keyboard())
+    await state.update_data(
+        p2i_status_chat_id=query.message.chat.id,
+        p2i_status_message_id=query.message.message_id,
     )
     await query.answer()
 
@@ -842,33 +1140,452 @@ async def pdf_to_images_start(query: CallbackQuery, state: FSMContext):
 )
 async def pdf_to_images_format_chosen(query: CallbackQuery, state: FSMContext):
     fmt = "png" if query.data == PDF_TO_IMG_PNG else "jpeg"
-    await state.update_data(pdf_to_images_format=fmt)
-    await state.set_state(PDFStates.waiting_for_file_pdf_to_images)
-    await query.message.edit_text("Send the PDF file to convert to images.", reply_markup=back_home_cancel())
     await query.answer()
+    await state.update_data(p2i_format=fmt)
+    await state.set_state(PDFStates.waiting_for_quality_pdf_to_images)
+    await _edit_p2i_message(query.bot, state, _p2i_quality_text(fmt), _p2i_quality_keyboard())
+
+
+@router.callback_query(PDFStates.waiting_for_quality_pdf_to_images, F.data == P2I_CB_BACK_TO_FORMAT)
+async def pdf_to_images_back_to_format(query: CallbackQuery, state: FSMContext):
+    await query.answer()
+    await state.set_state(PDFStates.waiting_for_format_pdf_to_images)
+    await _edit_p2i_message(query.bot, state, _p2i_welcome_text(), _p2i_format_keyboard())
+
+
+# --------------------------------------------------------------------------
+# Step 2: Image quality
+# --------------------------------------------------------------------------
+
+@router.callback_query(
+    PDFStates.waiting_for_quality_pdf_to_images,
+    F.data.in_({P2I_CB_DPI_STD, P2I_CB_DPI_HIGH, P2I_CB_DPI_MAX}),
+)
+async def pdf_to_images_quality_chosen(query: CallbackQuery, state: FSMContext):
+    dpi = _P2I_DPI_BY_CB[query.data]
+    await query.answer()
+    await state.update_data(p2i_dpi=dpi)
+    await state.set_state(PDFStates.waiting_for_file_pdf_to_images)
+    data = await state.get_data()
+    await _edit_p2i_message(query.bot, state, _p2i_upload_text(data.get("p2i_format", "png"), dpi), _p2i_upload_keyboard())
+
+
+@router.callback_query(PDFStates.waiting_for_file_pdf_to_images, F.data == P2I_CB_BACK_TO_QUALITY)
+async def pdf_to_images_back_to_quality(query: CallbackQuery, state: FSMContext):
+    await query.answer()
+    data = await state.get_data()
+    await state.set_state(PDFStates.waiting_for_quality_pdf_to_images)
+    await _edit_p2i_message(query.bot, state, _p2i_quality_text(data.get("p2i_format", "png")), _p2i_quality_keyboard())
+
+
+# --------------------------------------------------------------------------
+# Step 3/4: Upload PDF, validation, and processing
+# --------------------------------------------------------------------------
+
+async def _process_single_p2i_pdf(message: Message, state: FSMContext) -> None:
+    path = await _download_and_validate(message, state, SUPPORTED_PDF_EXTS, _PDF_MIME, "PDF")
+    if path is None:
+        return  # _download_and_validate already replied with a user-facing error
+
+    filename = message.document.file_name or "document.pdf"
+
+    try:
+        await message.delete()
+    except Exception as e:
+        logger.debug(f"PDF->Images: could not delete upload message: {e}")
+
+    await _edit_p2i_message(
+        message.bot, state,
+        "⏳ Processing PDF...\n\nPlease wait while your PDF is being analyzed.",
+        None,
+    )
+
+    try:
+        page_count = await PDFToImages().get_page_count(path)
+    except PDFProcessingError as e:
+        await untrack_temp_files(state, [path])
+        delete_paths([path])
+        await _send_temp_validation_error(message.bot, message.chat.id, f"❌ {e}")
+        data = await state.get_data()
+        await _edit_p2i_message(
+            message.bot, state,
+            _p2i_upload_text(data.get("p2i_format", "png"), data.get("p2i_dpi", DPI_HIGH)),
+            _p2i_upload_keyboard(),
+        )
+        return
+
+    await state.update_data(p2i_input_path=path, p2i_filename=filename, p2i_page_count=page_count)
+    await state.set_state(PDFStates.waiting_for_pages_pdf_to_images)
+    await _edit_p2i_message(message.bot, state, _p2i_choose_pages_text(page_count), _p2i_choose_pages_keyboard())
+
+
+async def _finalize_p2i_group(key: str, state: FSMContext) -> None:
+    try:
+        await asyncio.sleep(MERGE_BATCH_FINALIZE_DELAY_SECONDS)
+    except asyncio.CancelledError:
+        return
+    group = _p2i_pending_groups.pop(key, None)
+    _p2i_group_tasks.pop(key, None)
+    if not group:
+        return
+    if await state.get_state() != PDFStates.waiting_for_file_pdf_to_images.state:
+        return  # user navigated away while the album was still arriving
+
+    if len(group) > 1:
+        pdf_count = sum(
+            1 for m in group if m.document and validate_extension(m.document.file_name or "", SUPPORTED_PDF_EXTS)
+        )
+        for m in group:
+            try:
+                await m.delete()
+            except Exception as e:
+                logger.debug(f"PDF->Images: could not delete rejected album message: {e}")
+        if pdf_count > 1:
+            await _send_temp_validation_error(
+                group[0].bot, group[0].chat.id,
+                "❌ Please send only one PDF.\n\nPDF to Images converts one PDF at a time.",
+            )
+        else:
+            await _send_temp_validation_error(
+                group[0].bot, group[0].chat.id, "❌ Please send only one PDF document."
+            )
+        return
+
+    await _process_single_p2i_pdf(group[0], state)
 
 
 @router.message(PDFStates.waiting_for_file_pdf_to_images, F.document)
-async def pdf_to_images_process(message: Message, state: FSMContext, user_repo=None, db_user=None):
-    path = await _download_and_validate(message, state, SUPPORTED_PDF_EXTS, _PDF_MIME, "PDF", db_user=db_user)
-    if path is None:
-        return
-    data = await state.get_data()
-    fmt = data.get("pdf_to_images_format", "png")
-    await message.answer("Converting to images... please wait.")
-    try:
-        outputs = await PDFToImages().convert(path, fmt)
-    except Exception as e:
-        await _fail(message, state, e, [path])
+async def pdf_to_images_receive(message: Message, state: FSMContext):
+    doc = message.document
+    if not validate_extension(doc.file_name or "", SUPPORTED_PDF_EXTS):
+        try:
+            await message.delete()
+        except Exception as e:
+            logger.debug(f"PDF->Images: could not delete non-PDF upload: {e}")
+        await _send_temp_validation_error(message.bot, message.chat.id, "❌ Please send a PDF document.")
         return
 
-    for out in outputs:
-        await track_temp_file(state, out)
-    ext = "jpg" if fmt == "jpeg" else "png"
-    await _track_usage(user_repo, db_user)
-    await _finish_with_documents(
-        message, state, outputs,
-        filename_fn=lambda i: f"page_{i}.{ext}",
-        cleanup_paths=[path] + outputs,
+    if message.media_group_id:
+        key = f"{message.chat.id}:{message.media_group_id}"
+        group = _p2i_pending_groups.setdefault(key, [])
+        group.append(message)
+        old_task = _p2i_group_tasks.get(key)
+        if old_task and not old_task.done():
+            old_task.cancel()
+        _p2i_group_tasks[key] = asyncio.create_task(_finalize_p2i_group(key, state))
+        return
+
+    await _process_single_p2i_pdf(message, state)
+
+
+@router.message(PDFStates.waiting_for_file_pdf_to_images)
+async def pdf_to_images_receive_invalid(message: Message):
+    try:
+        await message.delete()
+    except Exception as e:
+        logger.debug(f"PDF->Images: could not delete invalid upload: {e}")
+    await _send_temp_validation_error(message.bot, message.chat.id, "❌ Please send a PDF document.")
+
+
+_P2I_PDF_LOADED_STATES = (
+    PDFStates.waiting_for_pages_pdf_to_images,
+    PDFStates.waiting_for_custom_pages_pdf_to_images,
+    PDFStates.waiting_for_ready_pdf_to_images,
+)
+
+
+@router.message(StateFilter(*_P2I_PDF_LOADED_STATES), F.document)
+async def pdf_to_images_already_loaded(message: Message):
+    try:
+        await message.delete()
+    except Exception as e:
+        logger.debug(f"PDF->Images: could not delete extra PDF upload: {e}")
+    await _send_temp_validation_error(
+        message.bot, message.chat.id,
+        "❌ A PDF is already loaded.\n\n"
+        "Convert it, edit the page selection, or cancel before uploading another PDF.",
     )
-    
+
+
+# --------------------------------------------------------------------------
+# Step 5: Choose pages (All / Custom)
+# --------------------------------------------------------------------------
+
+@router.callback_query(PDFStates.waiting_for_pages_pdf_to_images, F.data == P2I_CB_ALL_PAGES)
+async def pdf_to_images_all_pages(query: CallbackQuery, state: FSMContext):
+    await query.answer()
+    data = await state.get_data()
+    total = data.get("p2i_page_count", 0)
+    pages = list(range(1, total + 1))
+    await state.update_data(p2i_pages=pages, p2i_pages_label=str(total), p2i_selection_mode="all")
+    await state.set_state(PDFStates.waiting_for_ready_pdf_to_images)
+    data = await state.get_data()
+    await _edit_p2i_message(query.bot, state, _p2i_ready_text(data, pages), _p2i_ready_keyboard())
+
+
+@router.callback_query(PDFStates.waiting_for_pages_pdf_to_images, F.data == P2I_CB_CUSTOM_PAGES)
+async def pdf_to_images_custom_pages_prompt(query: CallbackQuery, state: FSMContext):
+    await query.answer()
+    await state.set_state(PDFStates.waiting_for_custom_pages_pdf_to_images)
+    await _edit_p2i_message(query.bot, state, _p2i_custom_pages_prompt_text(), _p2i_custom_pages_keyboard())
+
+
+@router.callback_query(PDFStates.waiting_for_custom_pages_pdf_to_images, F.data == P2I_CB_BACK_TO_PAGES)
+async def pdf_to_images_back_to_pages(query: CallbackQuery, state: FSMContext):
+    await query.answer()
+    data = await state.get_data()
+    await state.set_state(PDFStates.waiting_for_pages_pdf_to_images)
+    await _edit_p2i_message(query.bot, state, _p2i_choose_pages_text(data.get("p2i_page_count", 0)), _p2i_choose_pages_keyboard())
+
+
+@router.message(PDFStates.waiting_for_custom_pages_pdf_to_images, F.text)
+async def pdf_to_images_custom_pages_input(message: Message, state: FSMContext):
+    data = await state.get_data()
+    total = data.get("p2i_page_count", 0)
+
+    try:
+        await message.delete()
+    except Exception as e:
+        logger.debug(f"PDF->Images: could not delete custom-pages input message: {e}")
+
+    try:
+        pages = _parse_p2i_pages(message.text.strip(), total)
+    except ValueError as e:
+        await _send_temp_validation_error(message.bot, message.chat.id, f"❌ {e}")
+        return
+
+    label = f"{len(pages)}\n\n({_format_p2i_page_ranges(pages)})"
+    await state.update_data(p2i_pages=pages, p2i_pages_label=label, p2i_selection_mode="custom")
+    await state.set_state(PDFStates.waiting_for_ready_pdf_to_images)
+    data = await state.get_data()
+    await _edit_p2i_message(message.bot, state, _p2i_ready_text(data, pages), _p2i_ready_keyboard())
+
+
+@router.message(PDFStates.waiting_for_custom_pages_pdf_to_images)
+async def pdf_to_images_custom_pages_invalid(message: Message):
+    try:
+        await message.delete()
+    except Exception as e:
+        logger.debug(f"PDF->Images: could not delete non-text page input: {e}")
+    await _send_temp_validation_error(
+        message.bot, message.chat.id,
+        "❌ Please send the pages as text.\n\nExamples:\n\n1\n1-5\n1,3,8\n1-5,8,10-15",
+    )
+
+
+# --------------------------------------------------------------------------
+# Step 5 (review): PDF Ready -> Convert / Edit Pages
+# --------------------------------------------------------------------------
+
+@router.callback_query(PDFStates.waiting_for_ready_pdf_to_images, F.data == P2I_CB_EDIT_PAGES)
+async def pdf_to_images_edit_pages(query: CallbackQuery, state: FSMContext):
+    await query.answer()
+    data = await state.get_data()
+    if data.get("p2i_selection_mode") == "custom":
+        await state.set_state(PDFStates.waiting_for_custom_pages_pdf_to_images)
+        await _edit_p2i_message(query.bot, state, _p2i_custom_pages_prompt_text(), _p2i_custom_pages_keyboard())
+    else:
+        await state.set_state(PDFStates.waiting_for_pages_pdf_to_images)
+        await _edit_p2i_message(
+            query.bot, state, _p2i_choose_pages_text(data.get("p2i_page_count", 0)), _p2i_choose_pages_keyboard()
+        )
+
+
+# --------------------------------------------------------------------------
+# Step 6+: Convert, then send (albums of 10, delayed for large output)
+# --------------------------------------------------------------------------
+
+async def _p2i_send_images(
+    bot, state: FSMContext, chat_id: int,
+    results: List, fmt: str, filename_fn, input_path: str, review_data: dict,
+    user_repo, db_user,
+) -> None:
+    total = len(results)
+    chunks = [results[i:i + _P2I_ALBUM_SIZE] for i in range(0, total, _P2I_ALBUM_SIZE)]
+    total_albums = len(chunks)
+    output_paths = [p for _, p in results]
+    cleanup_paths = [input_path] + output_paths
+    is_document = fmt == "png"  # PNG -> Documents (lossless); JPG -> Photos (inline preview)
+
+    try:
+        if total > _P2I_LARGE_OUTPUT_THRESHOLD:
+            await _edit_p2i_message(
+                bot, state,
+                _p2i_sending_progress_text(0, total_albums, total_albums * _P2I_ALBUM_DELAY_SECONDS),
+                None,
+            )
+
+        last_edit = 0.0
+        for idx, chunk in enumerate(chunks, start=1):
+            media = []
+            for page_num, path in chunk:
+                fname = filename_fn(page_num)
+                if is_document:
+                    media.append(InputMediaDocument(media=FSInputFile(path, filename=fname)))
+                else:
+                    media.append(InputMediaPhoto(media=FSInputFile(path, filename=fname)))
+
+            try:
+                await bot.send_media_group(chat_id, media)
+            except Exception:
+                # One retry, matching Split's tolerance for transient
+                # Telegram/network hiccups during a multi-message send.
+                logger.warning(f"PDF->Images: album {idx}/{total_albums} send failed, retrying once")
+                await asyncio.sleep(1.0)
+                await bot.send_media_group(chat_id, media)
+
+            if idx < total_albums:
+                await asyncio.sleep(_P2I_ALBUM_DELAY_SECONDS)
+
+            if total > _P2I_LARGE_OUTPUT_THRESHOLD:
+                now = time.monotonic()
+                remaining = (total_albums - idx) * _P2I_ALBUM_DELAY_SECONDS
+                if now - last_edit >= _P2I_PROGRESS_EDIT_INTERVAL_SECONDS or idx == total_albums:
+                    pages_range = f"{chunk[0][0]}-{chunk[-1][0]}" if len(chunk) > 1 else str(chunk[0][0])
+                    await _edit_p2i_message(
+                        bot, state,
+                        _p2i_sending_progress_text(idx, total_albums, remaining, pages_range=pages_range),
+                        None,
+                    )
+                    last_edit = now
+    except Exception:
+        logger.exception(f"PDF->Images: failed sending images to chat {chat_id}")
+        delete_paths(cleanup_paths)
+        await untrack_temp_files(state, cleanup_paths)
+        await state.clear()
+        try:
+            await bot.send_message(chat_id, "❌ Failed to convert the PDF.\n\nPlease try again.")
+        except Exception:
+            pass
+        return
+
+    delete_paths(cleanup_paths)
+    await untrack_temp_files(state, cleanup_paths)
+    await _track_usage(user_repo, db_user)
+
+    status = await state.get_data()
+    old_chat_id = status.get("p2i_status_chat_id")
+    old_message_id = status.get("p2i_status_message_id")
+    await state.clear()
+    if old_chat_id is not None and old_message_id is not None:
+        try:
+            await bot.delete_message(chat_id=old_chat_id, message_id=old_message_id)
+        except Exception as e:
+            logger.debug(f"PDF->Images: could not delete progress message: {e}")
+
+    await bot.send_message(
+        chat_id,
+        "✅ Images created successfully!\n\n"
+        f"📄 Total Pages\n\n{review_data.get('p2i_page_count', 0)}\n\n"
+        f"📑 Converted Pages\n\n{total}\n\n"
+        f"🖼 Output Format\n\n{_p2i_format_label(fmt)}\n\n"
+        f"⭐ Image Quality\n\n{review_data.get('p2i_dpi', DPI_HIGH)} DPI",
+    )
+    logger.info(f"PDF->Images: completed for chat {chat_id}, {total} page(s) sent")
+
+
+@router.callback_query(PDFStates.waiting_for_ready_pdf_to_images, F.data == P2I_CB_CONVERT)
+async def pdf_to_images_convert(query: CallbackQuery, state: FSMContext, user_repo=None, db_user=None):
+    await query.answer()
+    chat_id = query.message.chat.id
+    data = await state.get_data()
+    path = data.get("p2i_input_path")
+    pages: List[int] = list(data.get("p2i_pages", []))
+    if not path or not pages:
+        await query.message.answer("Session expired, please start over.")
+        await _p2i_full_cleanup(state, chat_id)
+        return
+
+    fmt = data.get("p2i_format", "png")
+    dpi = data.get("p2i_dpi", DPI_HIGH)
+
+    # From this point Cancel is disabled -- conversion/sending runs to
+    # completion (or a hard failure), matching the spec.
+    await state.set_state(PDFStates.waiting_for_sending_pdf_to_images)
+    await _edit_p2i_message(
+        query.bot, state,
+        "⏳ Converting PDF...\n\n"
+        f"{_p2i_progress_bar(0, 1)}\n\n"
+        "Generating images...\n\n"
+        "This may take a moment.",
+        None,
+    )
+
+    try:
+        results = await PDFToImages().convert(path, fmt, dpi, pages)
+    except Exception as e:
+        logger.exception(f"PDF->Images: conversion failed for chat {chat_id}")
+        await _edit_p2i_message(query.bot, state, "❌ Failed to convert the PDF.\n\nPlease try again.", None)
+        await _p2i_full_cleanup(state, chat_id)
+        return
+
+    for _, p in results:
+        await track_temp_file(state, p)
+
+    total_pad = max(3, len(str(data.get("p2i_page_count", 0))))
+    stem = data.get("p2i_filename", "document.pdf")
+    if stem.lower().endswith(".pdf"):
+        stem = stem[:-4]
+    safe_stem = sanitize_filename(stem) or "document"
+    ext = "jpg" if fmt == "jpeg" else "png"
+
+    def filename_fn(page_num: int) -> str:
+        return f"{safe_stem} - Page {str(page_num).zfill(total_pad)}.{ext}"
+
+    await _p2i_send_images(query.bot, state, chat_id, results, fmt, filename_fn, path, data, user_repo, db_user)
+
+
+# --------------------------------------------------------------------------
+# Cancel (confirmed; disabled once conversion has started)
+# --------------------------------------------------------------------------
+
+@router.callback_query(StateFilter(*_P2I_CANCELABLE_STATES), F.data == P2I_CB_CANCEL)
+async def pdf_to_images_cancel_ask(query: CallbackQuery, state: FSMContext):
+    await query.answer()
+    await state.update_data(p2i_pre_cancel_state=await state.get_state())
+    await _edit_p2i_message(
+        query.bot, state,
+        "⚠️ Cancel this conversion?\n\nYour uploaded PDF will be discarded.",
+        _p2i_cancel_confirm_keyboard(),
+    )
+
+
+@router.callback_query(F.data == P2I_CB_CANCEL_YES)
+async def pdf_to_images_cancel_yes(query: CallbackQuery, state: FSMContext):
+    chat_id = query.message.chat.id
+    await query.answer()
+    await _p2i_full_cleanup(state, chat_id)
+    try:
+        await query.message.delete()
+    except Exception as e:
+        logger.debug(f"PDF->Images: could not delete workflow message on cancel: {e}")
+    await query.bot.send_message(chat_id, "📄 PDF Toolkit -- choose an operation:", reply_markup=get_pdf_menu())
+
+
+@router.callback_query(F.data == P2I_CB_CANCEL_NO)
+async def pdf_to_images_cancel_no(query: CallbackQuery, state: FSMContext):
+    await query.answer()
+    data = await state.get_data()
+    prev_state = data.get("p2i_pre_cancel_state")
+    await state.set_state(prev_state)
+
+    if prev_state == PDFStates.waiting_for_format_pdf_to_images.state:
+        await _edit_p2i_message(query.bot, state, _p2i_welcome_text(), _p2i_format_keyboard())
+    elif prev_state == PDFStates.waiting_for_quality_pdf_to_images.state:
+        await _edit_p2i_message(query.bot, state, _p2i_quality_text(data.get("p2i_format", "png")), _p2i_quality_keyboard())
+    elif prev_state == PDFStates.waiting_for_file_pdf_to_images.state:
+        await _edit_p2i_message(
+            query.bot, state,
+            _p2i_upload_text(data.get("p2i_format", "png"), data.get("p2i_dpi", DPI_HIGH)),
+            _p2i_upload_keyboard(),
+        )
+    elif prev_state == PDFStates.waiting_for_pages_pdf_to_images.state:
+        await _edit_p2i_message(query.bot, state, _p2i_choose_pages_text(data.get("p2i_page_count", 0)), _p2i_choose_pages_keyboard())
+    elif prev_state == PDFStates.waiting_for_custom_pages_pdf_to_images.state:
+        await _edit_p2i_message(query.bot, state, _p2i_custom_pages_prompt_text(), _p2i_custom_pages_keyboard())
+    elif prev_state == PDFStates.waiting_for_ready_pdf_to_images.state:
+        pages = list(data.get("p2i_pages", []))
+        await _edit_p2i_message(query.bot, state, _p2i_ready_text(data, pages), _p2i_ready_keyboard())
+
+
+register_stale_callbacks(prefix="pdf_p2i_")
