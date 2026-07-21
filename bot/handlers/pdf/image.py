@@ -1212,16 +1212,11 @@ async def pdf_to_images_back_to_quality(query: CallbackQuery, state: FSMContext)
 # --------------------------------------------------------------------------
 
 async def _process_single_p2i_pdf(message: Message, state: FSMContext) -> None:
-    path = await _download_and_validate(message, state, SUPPORTED_PDF_EXTS, _PDF_MIME, "PDF")
-    if path is None:
-        return  # _download_and_validate already replied with a user-facing error
-
-    filename = message.document.file_name or "document.pdf"
-
-    # Keep the uploaded PDF message visible -- do NOT delete it. Send ONE
-    # new workflow message directly below it and reuse that message for
-    # the rest of the flow (the only exception to the single-workflow-
-    # message rule, per spec).
+    # Immediate visual feedback: keep the uploaded PDF message visible --
+    # do NOT delete it -- and send ONE new workflow message directly below
+    # it *before* any download/validation/processing starts. This message
+    # is reused for the rest of the flow (the only exception to the
+    # single-workflow-message rule, per spec).
     status_msg = await message.bot.send_message(
         message.chat.id,
         "⏳ Downloading PDF...\n\nPlease wait while your PDF is being prepared.",
@@ -1230,6 +1225,21 @@ async def _process_single_p2i_pdf(message: Message, state: FSMContext) -> None:
         p2i_status_chat_id=status_msg.chat.id,
         p2i_status_message_id=status_msg.message_id,
     )
+
+    path = await _download_and_validate(message, state, SUPPORTED_PDF_EXTS, _PDF_MIME, "PDF")
+    if path is None:
+        # _download_and_validate already replied with a user-facing error;
+        # fall back the workflow message to the upload screen instead of
+        # leaving "Downloading PDF..." on screen.
+        data = await state.get_data()
+        await _edit_p2i_message(
+            message.bot, state,
+            _p2i_upload_text(data.get("p2i_format", "png"), data.get("p2i_dpi", DPI_HIGH)),
+            _p2i_upload_keyboard(),
+        )
+        return
+
+    filename = message.document.file_name or "document.pdf"
 
     try:
         page_count = await PDFToImages().get_page_count(path)
