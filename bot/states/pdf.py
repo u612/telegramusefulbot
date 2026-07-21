@@ -56,6 +56,14 @@ class PDFStates(StatesGroup):
     waiting_for_images_to_pdf = State()
     waiting_for_img2pdf_filename = State()
 
-    # PDF to Images
+    # PDF to Images (format -> quality -> upload -> choose pages ->
+    # [custom page input] -> review -> convert -> send)
     waiting_for_format_pdf_to_images = State()
+    waiting_for_quality_pdf_to_images = State()
     waiting_for_file_pdf_to_images = State()
+    waiting_for_pages_pdf_to_images = State()
+    waiting_for_custom_pages_pdf_to_images = State()
+    waiting_for_ready_pdf_to_images = State()
+    # No user input is awaited in this state -- it just marks "conversion
+    # is underway, Cancel is disabled" for the duration of convert+send.
+    waiting_for_sending_pdf_to_images = State()
