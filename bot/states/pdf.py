@@ -54,6 +54,7 @@ class PDFStates(StatesGroup):
     # Image to PDF (page size -> multi-file/album upload + build)
     waiting_for_page_size_img2pdf = State()
     waiting_for_images_to_pdf = State()
+    waiting_for_img2pdf_filename = State()
 
     # PDF to Images
     waiting_for_format_pdf_to_images = State()
