@@ -7,12 +7,13 @@ identically across the toolkit.
 PDF -> Images: choose an output format first, then upload the PDF.
 """
 import asyncio
+import random
 import time
 from typing import Dict, List, Optional
 
 from aiogram import Router, F
 from aiogram.types import (
-    Message, CallbackQuery, FSInputFile, InputMediaPhoto, InputMediaDocument,
+    Message, CallbackQuery, FSInputFile,
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.filters import StateFilter
@@ -33,7 +34,7 @@ from utils.session_manager import register_stale_callbacks
 
 from services.pdf.image_to_pdf import ImageToPDF
 from services.pdf.pdf_to_images import (
-    PDFToImages, DPI_STANDARD, DPI_HIGH, DPI_MAXIMUM,
+    PDFToImages, PDFPageRenderer, DPI_STANDARD, DPI_HIGH, DPI_MAXIMUM,
 )
 from services.pdf._common import PDFProcessingError
 
@@ -850,10 +851,10 @@ P2I_CB_CANCEL_NO = "pdf_p2i_cancel_no"
 _P2I_DPI_LABELS = {DPI_STANDARD: "Standard", DPI_HIGH: "High", DPI_MAXIMUM: "Maximum"}
 _P2I_DPI_BY_CB = {P2I_CB_DPI_STD: DPI_STANDARD, P2I_CB_DPI_HIGH: DPI_HIGH, P2I_CB_DPI_MAX: DPI_MAXIMUM}
 
-_P2I_LARGE_OUTPUT_THRESHOLD = 20
-_P2I_ALBUM_SIZE = 10
-_P2I_ALBUM_DELAY_SECONDS = 0.8
-_P2I_PROGRESS_EDIT_INTERVAL_SECONDS = 2.0
+# Per-page delay after each upload, per spec -- lets Telegram breathe and
+# gives the event loop a chance to process other updates (e.g. Cancel).
+_P2I_PAGE_DELAY_MIN_SECONDS = 0.1
+_P2I_PAGE_DELAY_MAX_SECONDS = 0.3
 
 _P2I_CANCELABLE_STATES = (
     PDFStates.waiting_for_format_pdf_to_images,
@@ -862,7 +863,17 @@ _P2I_CANCELABLE_STATES = (
     PDFStates.waiting_for_pages_pdf_to_images,
     PDFStates.waiting_for_custom_pages_pdf_to_images,
     PDFStates.waiting_for_ready_pdf_to_images,
+    PDFStates.waiting_for_sending_pdf_to_images,
 )
+
+# Per-chat in-flight-conversion bookkeeping. Deliberately NOT stored in FSM
+# data -- these are cheap flags read/written from both the conversion loop
+# and the Cancel callback handlers, which run as separate concurrent tasks.
+# `_p2i_cancel_flags[chat_id] = True` tells the running loop to stop after
+# its next check; `_p2i_display_locked[chat_id] = True` tells it to skip
+# dashboard edits while a Cancel confirmation dialog is on screen.
+_p2i_cancel_flags: Dict[int, bool] = {}
+_p2i_display_locked: Dict[int, bool] = {}
 
 # A PDF might arrive as part of a Telegram media group -- PDF -> Images only
 # ever accepts ONE PDF, so a whole album must be rejected as a unit rather
@@ -944,35 +955,38 @@ def _p2i_format_label(fmt: str) -> str:
 
 def _p2i_welcome_text() -> str:
     return (
-        "📸 PDF to Images\n\n"
-        "Convert PDF pages into high-quality images.\n\n"
+        "📤 PDF → Images\n\n"
+        "Convert every page of a PDF into high-quality images.\n\n"
+        "Supported\n\n"
+        "• PDF (.pdf)\n\n"
         "Choose your preferred output format."
     )
 
 
 def _p2i_quality_text(fmt: str) -> str:
     return (
-        "📸 PDF to Images\n\n"
+        "📤 PDF → Images\n\n"
         f"🖼 Output Format\n\n{_p2i_format_label(fmt)}\n\n"
         "⭐ Image Quality\n\n"
-        "Higher quality produces sharper images but increases file size and conversion time.\n\n"
-        "Choose the quality you'd like."
+        "Choose the image quality.\n\n"
+        "Higher quality produces sharper images but increases processing time and file size."
     )
 
 
 def _p2i_upload_text(fmt: str, dpi: int) -> str:
     return (
-        "📸 PDF to Images\n\n"
+        "📤 PDF → Images\n\n"
         f"🖼 Output Format\n\n{_p2i_format_label(fmt)}\n\n"
         f"⭐ Image Quality\n\n{dpi} DPI\n\n"
+        "📄 Upload PDF\n\n"
         "Send the PDF you want to convert."
     )
 
 
 def _p2i_choose_pages_text(total_pages: int) -> str:
     return (
-        "📸 PDF Ready\n\n"
-        f"📄 Total Pages\n\n{total_pages}\n\n"
+        "📄 PDF Loaded\n\n"
+        f"📑 Pages\n\n{total_pages}\n\n"
         "Choose which pages you'd like to convert."
     )
 
@@ -991,12 +1005,12 @@ def _p2i_custom_pages_prompt_text() -> str:
 
 def _p2i_ready_text(data: dict, pages: List[int]) -> str:
     return (
-        "📸 PDF Ready\n\n"
-        f"📄 Total Pages\n\n{data.get('p2i_page_count', 0)}\n\n"
-        f"📑 Selected Pages\n\n{data.get('p2i_pages_label', str(len(pages)))}\n\n"
+        "📄 Ready to Convert\n\n"
+        f"📑 Total Pages\n\n{data.get('p2i_page_count', 0)}\n\n"
+        f"📄 Selected Pages\n\n{data.get('p2i_pages_label', str(len(pages)))}\n\n"
         f"🖼 Output Format\n\n{_p2i_format_label(data.get('p2i_format', 'png'))}\n\n"
         f"⭐ Image Quality\n\n{data.get('p2i_dpi', DPI_HIGH)} DPI\n\n"
-        "Review your settings before converting."
+        "Everything looks good."
     )
 
 
@@ -1005,22 +1019,35 @@ def _p2i_progress_bar(done: int, total: int, width: int = 18) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
-def _p2i_sending_progress_text(
-    done_albums: int, total_albums: int, est_remaining_seconds: float, pages_range: Optional[str] = None
-) -> str:
-    pct = int((done_albums / total_albums) * 100) if total_albums else 0
-    bar = _p2i_progress_bar(done_albums, total_albums)
-    eta = "Almost done..." if est_remaining_seconds < 3 else f"~{int(round(est_remaining_seconds))} seconds"
-    lines = [
-        "📤 Sending Images...", "",
-        bar, "",
-        f"Progress\n\n{pct}%", "",
-        f"Albums\n\n{done_albums} / {total_albums}",
-    ]
-    if pages_range:
-        lines += ["", f"Pages\n\n{pages_range}"]
-    lines += ["", f"ETA\n\n{eta}"]
-    return "\n".join(lines)
+def _p2i_format_eta(seconds: float) -> str:
+    if seconds < 3:
+        return "Almost done..."
+    total = int(round(seconds))
+    minutes, secs = divmod(total, 60)
+    if minutes:
+        return f"~{minutes}m {secs}s"
+    return f"~{secs}s"
+
+
+def _p2i_dashboard_text(uploaded: int, total: int, current_page: int, eta_seconds: float) -> str:
+    pct = int((uploaded / total) * 100) if total else 0
+    bar = _p2i_progress_bar(uploaded, total)
+    return (
+        "📤 PDF → Images\n\n"
+        f"{bar}\n\n"
+        f"Progress\n\n{pct}%\n\n"
+        f"Pages\n\n{uploaded} / {total}\n\n"
+        f"Uploaded\n\n{uploaded} / {total}\n\n"
+        f"Current\n\nUploading Page {current_page}...\n\n"
+        f"ETA\n\n{_p2i_format_eta(eta_seconds)}"
+    )
+
+
+def _p2i_dashboard_keyboard():
+    b = InlineKeyboardBuilder()
+    b.button(text="❌ Cancel", callback_data=P2I_CB_CANCEL)
+    b.adjust(1)
+    return b.as_markup()
 
 
 def _format_p2i_page_ranges(pages: List[int]) -> str:
@@ -1112,6 +1139,8 @@ async def _p2i_full_cleanup(state: FSMContext, chat_id: int) -> None:
         task = _p2i_group_tasks.pop(key, None)
         if task and not task.done():
             task.cancel()
+    _p2i_cancel_flags.pop(chat_id, None)
+    _p2i_display_locked.pop(chat_id, None)
     files = await get_tracked_files(state)
     if files:
         delete_paths(files)
@@ -1189,15 +1218,17 @@ async def _process_single_p2i_pdf(message: Message, state: FSMContext) -> None:
 
     filename = message.document.file_name or "document.pdf"
 
-    try:
-        await message.delete()
-    except Exception as e:
-        logger.debug(f"PDF->Images: could not delete upload message: {e}")
-
-    await _edit_p2i_message(
-        message.bot, state,
-        "⏳ Processing PDF...\n\nPlease wait while your PDF is being analyzed.",
-        None,
+    # Keep the uploaded PDF message visible -- do NOT delete it. Send ONE
+    # new workflow message directly below it and reuse that message for
+    # the rest of the flow (the only exception to the single-workflow-
+    # message rule, per spec).
+    status_msg = await message.bot.send_message(
+        message.chat.id,
+        "⏳ Downloading PDF...\n\nPlease wait while your PDF is being prepared.",
+    )
+    await state.update_data(
+        p2i_status_chat_id=status_msg.chat.id,
+        p2i_status_message_id=status_msg.message_id,
     )
 
     try:
@@ -1392,96 +1423,178 @@ async def pdf_to_images_edit_pages(query: CallbackQuery, state: FSMContext):
 
 
 # --------------------------------------------------------------------------
-# Step 6+: Convert, then send (albums of 10, delayed for large output)
+# Step 6+: Convert and send, one page at a time (streaming)
 # --------------------------------------------------------------------------
 
-async def _p2i_send_images(
-    bot, state: FSMContext, chat_id: int,
-    results: List, fmt: str, filename_fn, input_path: str, review_data: dict,
-    user_repo, db_user,
-) -> None:
-    total = len(results)
-    chunks = [results[i:i + _P2I_ALBUM_SIZE] for i in range(0, total, _P2I_ALBUM_SIZE)]
-    total_albums = len(chunks)
-    output_paths = [p for _, p in results]
-    cleanup_paths = [input_path] + output_paths
-    is_document = fmt == "png"  # PNG -> Documents (lossless); JPG -> Photos (inline preview)
-
+async def _p2i_edit_final(bot, status_chat_id, status_message_id, text: str) -> None:
+    """Edit the workflow message directly by id -- used for the final
+    screens (success/failure/cancelled), which run after FSM state (and
+    therefore the ids `_edit_p2i_message` reads from state) has already
+    been cleared.
+    """
+    if status_chat_id is None or status_message_id is None:
+        return
     try:
-        if total > _P2I_LARGE_OUTPUT_THRESHOLD:
-            await _edit_p2i_message(
-                bot, state,
-                _p2i_sending_progress_text(0, total_albums, total_albums * _P2I_ALBUM_DELAY_SECONDS),
-                None,
-            )
+        await bot.edit_message_text(text, chat_id=status_chat_id, message_id=status_message_id, reply_markup=None)
+    except Exception as e:
+        logger.debug(f"PDF->Images: could not edit workflow message: {e}")
 
-        last_edit = 0.0
-        for idx, chunk in enumerate(chunks, start=1):
-            media = []
-            for page_num, path in chunk:
-                fname = filename_fn(page_num)
-                if is_document:
-                    media.append(InputMediaDocument(media=FSInputFile(path, filename=fname)))
-                else:
-                    media.append(InputMediaPhoto(media=FSInputFile(path, filename=fname)))
 
-            try:
-                await bot.send_media_group(chat_id, media)
-            except Exception:
-                # One retry, matching Split's tolerance for transient
-                # Telegram/network hiccups during a multi-message send.
-                logger.warning(f"PDF->Images: album {idx}/{total_albums} send failed, retrying once")
-                await asyncio.sleep(1.0)
-                await bot.send_media_group(chat_id, media)
+async def _p2i_report_failure(
+    bot, state: FSMContext, input_path: str, completed: int, total: int, reason: str,
+) -> None:
+    delete_paths([input_path])
+    await untrack_temp_files(state, [input_path])
+    status = await state.get_data()
+    status_chat_id = status.get("p2i_status_chat_id")
+    status_message_id = status.get("p2i_status_message_id")
+    await state.clear()
+    await _p2i_edit_final(
+        bot, status_chat_id, status_message_id,
+        "❌ Conversion Failed\n\n"
+        f"Last Completed\n\n{completed}/{total}\n\n"
+        "Reason\n\n"
+        f"{reason}\n\n"
+        "Please try again later.",
+    )
 
-            if idx < total_albums:
-                await asyncio.sleep(_P2I_ALBUM_DELAY_SECONDS)
 
-            if total > _P2I_LARGE_OUTPUT_THRESHOLD:
-                now = time.monotonic()
-                remaining = (total_albums - idx) * _P2I_ALBUM_DELAY_SECONDS
-                if now - last_edit >= _P2I_PROGRESS_EDIT_INTERVAL_SECONDS or idx == total_albums:
-                    pages_range = f"{chunk[0][0]}-{chunk[-1][0]}" if len(chunk) > 1 else str(chunk[0][0])
-                    await _edit_p2i_message(
-                        bot, state,
-                        _p2i_sending_progress_text(idx, total_albums, remaining, pages_range=pages_range),
-                        None,
-                    )
-                    last_edit = now
+async def _p2i_report_cancelled(
+    bot, state: FSMContext, chat_id: int, input_path: str, uploaded: int, total: int,
+) -> None:
+    delete_paths([input_path])
+    await untrack_temp_files(state, [input_path])
+    status = await state.get_data()
+    status_chat_id = status.get("p2i_status_chat_id")
+    status_message_id = status.get("p2i_status_message_id")
+    await state.clear()
+    await _p2i_edit_final(
+        bot, status_chat_id, status_message_id,
+        "🛑 Conversion Cancelled\n\n"
+        f"Uploaded Images\n\n{uploaded}\n\n"
+        f"Remaining Pages\n\n{total - uploaded}\n\n"
+        "Thank you for using File Toolkit.",
+    )
+    _p2i_cancel_flags.pop(chat_id, None)
+    _p2i_display_locked.pop(chat_id, None)
+
+
+async def _p2i_run_conversion(
+    bot, state: FSMContext, chat_id: int,
+    input_path: str, pages: List[int], fmt: str, dpi: int, filename_fn,
+    review_data: dict, user_repo, db_user,
+) -> None:
+    """Render and upload one page at a time: render -> save temp image ->
+    upload -> delete temp image -> release page resources -> update the
+    live dashboard -> short delay -> next page. Never holds more than one
+    rendered page in memory or one temp image on disk at once, per spec.
+    """
+    total = len(pages)
+    is_document = fmt == "png"  # PNG -> Documents (lossless); JPG -> Photos (inline preview)
+    _p2i_cancel_flags[chat_id] = False
+    _p2i_display_locked[chat_id] = False
+
+    renderer = PDFPageRenderer(input_path)
+    try:
+        await renderer.open()
+    except PDFProcessingError as e:
+        await _p2i_report_failure(bot, state, input_path, 0, total, str(e))
+        _p2i_cancel_flags.pop(chat_id, None)
+        _p2i_display_locked.pop(chat_id, None)
+        return
     except Exception:
-        logger.exception(f"PDF->Images: failed sending images to chat {chat_id}")
-        delete_paths(cleanup_paths)
-        await untrack_temp_files(state, cleanup_paths)
-        await state.clear()
-        try:
-            await bot.send_message(chat_id, "❌ Failed to convert the PDF.\n\nPlease try again.")
-        except Exception:
-            pass
+        logger.exception(f"PDF->Images: failed to open PDF for chat {chat_id}")
+        await _p2i_report_failure(bot, state, input_path, 0, total, "Unexpected processing error.")
+        _p2i_cancel_flags.pop(chat_id, None)
+        _p2i_display_locked.pop(chat_id, None)
         return
 
-    delete_paths(cleanup_paths)
-    await untrack_temp_files(state, cleanup_paths)
+    uploaded = 0
+    start = time.monotonic()
+
+    for page_num in pages:
+        if _p2i_cancel_flags.get(chat_id):
+            await renderer.close()
+            await _p2i_report_cancelled(bot, state, chat_id, input_path, uploaded, total)
+            return
+
+        try:
+            img_path = await renderer.render_page(page_num, fmt, dpi)
+        except Exception:
+            logger.exception(f"PDF->Images: failed rendering page {page_num} for chat {chat_id}")
+            await renderer.close()
+            await _p2i_report_failure(bot, state, input_path, uploaded, total, "Unexpected processing error.")
+            _p2i_cancel_flags.pop(chat_id, None)
+            _p2i_display_locked.pop(chat_id, None)
+            return
+
+        fname = filename_fn(page_num)
+        try:
+            if is_document:
+                await bot.send_document(chat_id, FSInputFile(img_path, filename=fname))
+            else:
+                await bot.send_photo(chat_id, FSInputFile(img_path, filename=fname))
+        except Exception:
+            # One retry, matching the toolkit's tolerance for transient
+            # Telegram/network hiccups during a multi-message send.
+            logger.warning(f"PDF->Images: page {page_num} send failed, retrying once")
+            try:
+                await asyncio.sleep(1.0)
+                if is_document:
+                    await bot.send_document(chat_id, FSInputFile(img_path, filename=fname))
+                else:
+                    await bot.send_photo(chat_id, FSInputFile(img_path, filename=fname))
+            except Exception:
+                logger.exception(f"PDF->Images: failed sending page {page_num} to chat {chat_id}")
+                delete_paths([img_path])
+                await renderer.close()
+                await _p2i_report_failure(bot, state, input_path, uploaded, total, "Unexpected processing error.")
+                _p2i_cancel_flags.pop(chat_id, None)
+                _p2i_display_locked.pop(chat_id, None)
+                return
+
+        delete_paths([img_path])
+        uploaded += 1
+
+        if _p2i_cancel_flags.get(chat_id):
+            await renderer.close()
+            await _p2i_report_cancelled(bot, state, chat_id, input_path, uploaded, total)
+            return
+
+        if not _p2i_display_locked.get(chat_id):
+            elapsed = time.monotonic() - start
+            rate = elapsed / uploaded if uploaded else 0.0
+            remaining_eta = (total - uploaded) * rate
+            await _edit_p2i_message(
+                bot, state,
+                _p2i_dashboard_text(uploaded, total, page_num, remaining_eta),
+                _p2i_dashboard_keyboard(),
+            )
+
+        await asyncio.sleep(random.uniform(_P2I_PAGE_DELAY_MIN_SECONDS, _P2I_PAGE_DELAY_MAX_SECONDS))
+
+    await renderer.close()
+    _p2i_cancel_flags.pop(chat_id, None)
+    _p2i_display_locked.pop(chat_id, None)
+
+    delete_paths([input_path])
+    await untrack_temp_files(state, [input_path])
     await _track_usage(user_repo, db_user)
 
     status = await state.get_data()
-    old_chat_id = status.get("p2i_status_chat_id")
-    old_message_id = status.get("p2i_status_message_id")
+    status_chat_id = status.get("p2i_status_chat_id")
+    status_message_id = status.get("p2i_status_message_id")
     await state.clear()
-    if old_chat_id is not None and old_message_id is not None:
-        try:
-            await bot.delete_message(chat_id=old_chat_id, message_id=old_message_id)
-        except Exception as e:
-            logger.debug(f"PDF->Images: could not delete progress message: {e}")
-
-    await bot.send_message(
-        chat_id,
-        "✅ Images created successfully!\n\n"
+    await _p2i_edit_final(
+        bot, status_chat_id, status_message_id,
+        "✅ Conversion Complete\n\n"
         f"📄 Total Pages\n\n{review_data.get('p2i_page_count', 0)}\n\n"
-        f"📑 Converted Pages\n\n{total}\n\n"
+        f"🖼 Images Sent\n\n{uploaded}\n\n"
         f"🖼 Output Format\n\n{_p2i_format_label(fmt)}\n\n"
-        f"⭐ Image Quality\n\n{review_data.get('p2i_dpi', DPI_HIGH)} DPI",
+        f"⭐ Quality\n\n{dpi} DPI\n\n"
+        "Thank you for using File Toolkit.",
     )
-    logger.info(f"PDF->Images: completed for chat {chat_id}, {total} page(s) sent")
+    logger.info(f"PDF->Images: completed for chat {chat_id}, {uploaded} page(s) sent")
 
 
 @router.callback_query(PDFStates.waiting_for_ready_pdf_to_images, F.data == P2I_CB_CONVERT)
@@ -1499,28 +1612,12 @@ async def pdf_to_images_convert(query: CallbackQuery, state: FSMContext, user_re
     fmt = data.get("p2i_format", "png")
     dpi = data.get("p2i_dpi", DPI_HIGH)
 
-    # From this point Cancel is disabled -- conversion/sending runs to
-    # completion (or a hard failure), matching the spec.
     await state.set_state(PDFStates.waiting_for_sending_pdf_to_images)
     await _edit_p2i_message(
         query.bot, state,
-        "⏳ Converting PDF...\n\n"
-        f"{_p2i_progress_bar(0, 1)}\n\n"
-        "Generating images...\n\n"
-        "This may take a moment.",
+        "⏳ Preparing Conversion...\n\nLoading your PDF and initializing the conversion.",
         None,
     )
-
-    try:
-        results = await PDFToImages().convert(path, fmt, dpi, pages)
-    except Exception as e:
-        logger.exception(f"PDF->Images: conversion failed for chat {chat_id}")
-        await _edit_p2i_message(query.bot, state, "❌ Failed to convert the PDF.\n\nPlease try again.", None)
-        await _p2i_full_cleanup(state, chat_id)
-        return
-
-    for _, p in results:
-        await track_temp_file(state, p)
 
     total_pad = max(3, len(str(data.get("p2i_page_count", 0))))
     stem = data.get("p2i_filename", "document.pdf")
@@ -1532,28 +1629,49 @@ async def pdf_to_images_convert(query: CallbackQuery, state: FSMContext, user_re
     def filename_fn(page_num: int) -> str:
         return f"{safe_stem} - Page {str(page_num).zfill(total_pad)}.{ext}"
 
-    await _p2i_send_images(query.bot, state, chat_id, results, fmt, filename_fn, path, data, user_repo, db_user)
+    await _p2i_run_conversion(
+        query.bot, state, chat_id, path, pages, fmt, dpi, filename_fn, data, user_repo, db_user,
+    )
 
 
 # --------------------------------------------------------------------------
-# Cancel (confirmed; disabled once conversion has started)
+# Cancel (confirmed at every step, including mid-conversion)
 # --------------------------------------------------------------------------
 
 @router.callback_query(StateFilter(*_P2I_CANCELABLE_STATES), F.data == P2I_CB_CANCEL)
 async def pdf_to_images_cancel_ask(query: CallbackQuery, state: FSMContext):
     await query.answer()
-    await state.update_data(p2i_pre_cancel_state=await state.get_state())
-    await _edit_p2i_message(
-        query.bot, state,
-        "⚠️ Cancel this conversion?\n\nYour uploaded PDF will be discarded.",
-        _p2i_cancel_confirm_keyboard(),
-    )
+    chat_id = query.message.chat.id
+    current_state = await state.get_state()
+    await state.update_data(p2i_pre_cancel_state=current_state)
+    if current_state == PDFStates.waiting_for_sending_pdf_to_images.state:
+        # Pause dashboard edits while the confirmation is on screen -- the
+        # conversion loop keeps running underneath and will stop as soon
+        # as it next checks the cancel flag.
+        _p2i_display_locked[chat_id] = True
+        text = (
+            "⚠️ Cancel Conversion?\n\n"
+            "The conversion will stop immediately.\n\n"
+            "Images already sent cannot be removed."
+        )
+    else:
+        text = "⚠️ Cancel this conversion?\n\nYour uploaded PDF will be discarded."
+    await _edit_p2i_message(query.bot, state, text, _p2i_cancel_confirm_keyboard())
 
 
 @router.callback_query(F.data == P2I_CB_CANCEL_YES)
 async def pdf_to_images_cancel_yes(query: CallbackQuery, state: FSMContext):
     chat_id = query.message.chat.id
     await query.answer()
+    data = await state.get_data()
+    pre_state = data.get("p2i_pre_cancel_state")
+    if pre_state == PDFStates.waiting_for_sending_pdf_to_images.state:
+        # The running conversion loop notices this flag and performs its
+        # own cleanup + shows the Cancelled screen -- nothing more to do
+        # here, since the loop is the one that knows how many pages have
+        # been uploaded so far.
+        _p2i_cancel_flags[chat_id] = True
+        return
     await _p2i_full_cleanup(state, chat_id)
     try:
         await query.message.delete()
@@ -1565,8 +1683,16 @@ async def pdf_to_images_cancel_yes(query: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == P2I_CB_CANCEL_NO)
 async def pdf_to_images_cancel_no(query: CallbackQuery, state: FSMContext):
     await query.answer()
+    chat_id = query.message.chat.id
     data = await state.get_data()
     prev_state = data.get("p2i_pre_cancel_state")
+
+    if prev_state == PDFStates.waiting_for_sending_pdf_to_images.state:
+        # Conversion state never changed -- just unlock the dashboard so
+        # the running loop resumes updating it on its next page.
+        _p2i_display_locked[chat_id] = False
+        return
+
     await state.set_state(prev_state)
 
     if prev_state == PDFStates.waiting_for_format_pdf_to_images.state:
