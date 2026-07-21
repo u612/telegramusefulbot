@@ -51,7 +51,8 @@ class PDFStates(StatesGroup):
     waiting_for_file_password_remove = State()
     waiting_for_password_remove_value = State()
 
-    # Image to PDF (multi-file upload + Done button)
+    # Image to PDF (page size -> multi-file/album upload + build)
+    waiting_for_page_size_img2pdf = State()
     waiting_for_images_to_pdf = State()
 
     # PDF to Images
