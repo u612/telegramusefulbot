@@ -86,8 +86,10 @@ class _Img2PdfBatch:
     __slots__ = ("pending", "seen_file_unique_ids", "task")
 
     def __init__(self):
-        # Ordered list of Message objects, exactly in the order Telegram
-        # delivered them -- this list IS the order guarantee.
+        # Messages buffered since the last finalize, in the order the
+        # handler received them. Arrival order is NOT the final upload
+        # order for albums -- see `_order_pending_for_download`, which
+        # re-sorts by media_group_id + message_id before downloading.
         self.pending: List[Message] = []
         self.seen_file_unique_ids: set = set()
         self.task: Optional[asyncio.Task] = None
@@ -361,17 +363,49 @@ async def _download_one_image(message: Message, state: FSMContext, size_ceiling:
     return path
 
 
+def _order_pending_for_download(pending: List[Message]) -> List[Message]:
+    """Return `pending` reordered so it matches the order the user actually
+    sees in Telegram, not the (unreliable) order the handler received the
+    updates in.
+
+    Telegram delivers each photo/document of an album as a separate
+    update, and those updates can arrive out of order. Grouping by
+    `media_group_id` and sorting each group by `message_id` recovers the
+    true album order, since Telegram assigns message_ids sequentially in
+    the order the album was sent. Standalone messages (no media_group_id)
+    are treated as their own single-item group, so they simply keep their
+    relative position -- the position a key is used for the first time is
+    its position in the output, which for a solo message is just where it
+    arrived among the other bursts/groups.
+    """
+    groups: "Dict[object, List[Message]]" = {}
+    key_order: List[object] = []
+    for msg in pending:
+        key = msg.media_group_id if msg.media_group_id else ("__solo__", msg.message_id)
+        if key not in groups:
+            groups[key] = []
+            key_order.append(key)
+        groups[key].append(msg)
+
+    ordered: List[Message] = []
+    for key in key_order:
+        group = groups[key]
+        group.sort(key=lambda m: m.message_id)
+        ordered.extend(group)
+    return ordered
+
+
 async def _process_pending_img2pdf_batch(state: FSMContext, chat_id: int, limits, size_ceiling: Optional[int]) -> tuple:
     """MUST be called while holding get_img2pdf_lock(chat_id). Downloads
-    every currently-buffered message, strictly in delivery order,
-    appending each to the session's upload order before moving to the
-    next. Returns (added_count, failed_count).
+    every currently-buffered message, in the user's true upload order
+    (see `_order_pending_for_download`), appending each to the session's
+    upload order before moving to the next. Returns (added_count, failed_count).
     """
     batch = _img2pdf_batches.get(chat_id)
     if batch is None or not batch.pending:
         return 0, 0
 
-    pending = batch.pending
+    pending = _order_pending_for_download(batch.pending)
     batch.pending = []
 
     added = 0
