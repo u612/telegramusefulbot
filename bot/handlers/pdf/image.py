@@ -36,7 +36,7 @@ from utils.tempfiles import (
     new_temp_path, track_temp_file, untrack_temp_files,
     get_tracked_files, delete_paths,
 )
-from utils.validators import validate_extension, validate_file_size
+from utils.validators import validate_extension, validate_file_size, sanitize_filename
 
 from .common import (
     _PDF_MIME, _download_and_validate, _fail, _track_usage,
@@ -442,9 +442,6 @@ async def _finalize_img2pdf_batch(bot, state: FSMContext, chat_id: int, limits, 
         if await state.get_state() != PDFStates.waiting_for_images_to_pdf.state:
             return  # flow was cancelled/finished/navigated away meanwhile
 
-        data_before = await state.get_data()
-        was_empty = len(data_before.get("img2pdf_upload_order", [])) == 0
-
         added, failed = await _process_pending_img2pdf_batch(state, chat_id, limits, size_ceiling)
         if added == 0 and failed == 0:
             return
@@ -457,14 +454,19 @@ async def _finalize_img2pdf_batch(bot, state: FSMContext, chat_id: int, limits, 
 
         data = await state.get_data()
         if not data.get("img2pdf_upload_order"):
-            return  # everything in this burst failed; stay on the upload prompt
+            # Everything in this burst failed -- the "Processing..." message
+            # is already on screen, so edit it back to the upload prompt
+            # instead of leaving it stuck, or sending a duplicate message.
+            page_size = data.get("img2pdf_page_size", PAGE_SIZE_A4)
+            await _edit_workflow_message(
+                bot, state, _render_upload_prompt_text(page_size), _upload_prompt_keyboard()
+            )
+            return
 
-        # First successful upload sends a brand-new message below the
-        # images; every later burst also sends a fresh message so
-        # controls stay below the newest uploads. `was_empty` only
-        # matters for logging clarity here since both paths behave the
-        # same (delete previous workflow message, send a new one).
-        await _show_images_added_screen(bot, state, chat_id, as_new_message=True)
+        # The "Processing..." message sent when this burst started is
+        # still on screen below the uploads -- edit it into the final
+        # "Images Added" screen rather than sending a new message.
+        await _show_images_added_screen(bot, state, chat_id, as_new_message=False)
         logger.info(f"Image->PDF: batch finalized for chat {chat_id}: {added} added, {failed} failed")
 
 
@@ -514,11 +516,25 @@ async def pdf_image_to_pdf_receive(message: Message, state: FSMContext, db_user=
 
         if file_unique_id:
             batch.seen_file_unique_ids.add(file_unique_id)
+
+        starting_new_burst = batch.task is None
         batch.pending.append(message)
 
         previous_task = batch.task
         if previous_task and not previous_task.done():
             previous_task.cancel()
+
+        if starting_new_burst:
+            # Show feedback immediately -- don't make the user wait on
+            # downloads/validation before they see anything happened.
+            # This same message is later edited in place once processing
+            # finishes (see `_finalize_img2pdf_batch`).
+            await _send_new_workflow_message(
+                message.bot, state, chat_id,
+                "⏳ Processing uploaded images...\n\nPlease wait while your images are being prepared.",
+                None,
+            )
+
         batch.task = asyncio.create_task(
             _finalize_img2pdf_batch(message.bot, state, chat_id, limits, size_ceiling)
         )
@@ -623,7 +639,11 @@ async def pdf_image_to_pdf_create(query: CallbackQuery, state: FSMContext, user_
         cancel_pending_img2pdf_batch(chat_id)
         await state.update_data(img2pdf_creating=True)
 
-        await _edit_workflow_message(query.bot, state, "⏳ Creating your PDF...", None)
+        await _edit_workflow_message(
+            query.bot, state,
+            "⏳ Creating your PDF...\n\nPlease wait while your PDF is being generated.",
+            None,
+        )
 
         page_size = data.get("img2pdf_page_size", PAGE_SIZE_A4)
         limits = get_effective_limits(query.from_user.id, db_user)
@@ -640,9 +660,21 @@ async def pdf_image_to_pdf_create(query: CallbackQuery, state: FSMContext, user_
         await track_temp_file(state, output_path)
         cleanup_paths = order + [output_path]
         count = len(order)
+        # Same naming helper Merge uses to turn a base name into a safe
+        # output filename -- Image->PDF has no filename-entry step, so
+        # the base name is fixed rather than user-supplied.
+        filename = f"{sanitize_filename('images')}.pdf"
+        status_data = await state.get_data()
+        status_chat_id = status_data.get("img2pdf_status_chat_id")
+        status_message_id = status_data.get("img2pdf_status_message_id")
         try:
-            await query.bot.send_document(chat_id, FSInputFile(output_path, filename="images.pdf"))
+            await query.bot.send_document(chat_id, FSInputFile(output_path, filename=filename))
             await _track_usage(user_repo, db_user)
+            if status_chat_id is not None and status_message_id is not None:
+                try:
+                    await query.bot.delete_message(chat_id=status_chat_id, message_id=status_message_id)
+                except Exception as e:
+                    logger.debug(f"Image->PDF: could not delete 'Creating your PDF...' message: {e}")
             await query.bot.send_message(
                 chat_id,
                 "✅ PDF created successfully!\n\n"
