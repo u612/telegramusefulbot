@@ -22,7 +22,11 @@ from .extract import router as extract_router
 from .rearrange import router as rearrange_router
 from .watermark import router as watermark_router
 from .password import router as password_router
-from .image import router as image_router
+from .image import (
+    router as image_router,
+    cancel_pending_img2pdf_batch,
+    get_img2pdf_lock,
+)
 
 router = Router()
 
