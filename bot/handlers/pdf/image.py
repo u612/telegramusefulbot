@@ -165,6 +165,13 @@ def _images_added_keyboard(reversed_: bool):
     return b.as_markup()
 
 
+def _filename_prompt_keyboard():
+    b = InlineKeyboardBuilder()
+    b.button(text="❌ Cancel", callback_data=IMG2PDF_CB_CANCEL)
+    b.adjust(1)
+    return b.as_markup()
+
+
 def _clear_confirm_keyboard():
     b = InlineKeyboardBuilder()
     b.button(text="🗑 Yes, Clear All", callback_data=IMG2PDF_CB_CLEAR_YES)
@@ -623,7 +630,11 @@ async def pdf_image_to_pdf_clear_no(query: CallbackQuery, state: FSMContext):
 # --------------------------------------------------------------------------
 
 @router.callback_query(PDFStates.waiting_for_images_to_pdf, F.data == IMG2PDF_CB_CREATE)
-async def pdf_image_to_pdf_create(query: CallbackQuery, state: FSMContext, user_repo=None, db_user=None):
+async def pdf_image_to_pdf_create(query: CallbackQuery, state: FSMContext):
+    """Mirrors Merge's Confirm -> filename prompt step: don't generate yet,
+    just ask for the output filename first (see
+    `pdf_merge_preview_confirm` in merge.py).
+    """
     chat_id = query.message.chat.id
     await query.answer()
 
@@ -637,16 +648,52 @@ async def pdf_image_to_pdf_create(query: CallbackQuery, state: FSMContext, user_
             return
 
         cancel_pending_img2pdf_batch(chat_id)
+        await state.set_state(PDFStates.waiting_for_img2pdf_filename)
+        text = (
+            f"🖼 Images Added: {len(order)}\n\n"
+            "📝 Send the output filename (e.g. my_images) -- I'll add .pdf for you."
+        )
+        await _edit_workflow_message(query.bot, state, text, _filename_prompt_keyboard())
+        logger.info(f"Image->PDF: awaiting output filename from user {query.from_user.id}")
+
+
+@router.message(PDFStates.waiting_for_img2pdf_filename, F.text)
+async def pdf_image_to_pdf_filename_receive(message: Message, state: FSMContext, user_repo=None, db_user=None):
+    chat_id = message.chat.id
+
+    async with get_img2pdf_lock(chat_id):
+        data = await state.get_data()
+        if data.get("img2pdf_creating"):
+            return  # duplicate submission while already processing
+        order = _current_order(data)
+        if not order:
+            await message.answer("Session expired, please start over.")
+            await state.clear()
+            return
+
+        # Same sanitization/fallback Merge uses for a user-supplied name.
+        safe = sanitize_filename(message.text.strip())
+        if safe.lower().endswith(".pdf"):
+            safe = safe[:-4]
+        if not safe:
+            safe = "images"
+        filename = f"{safe}.pdf"
+
         await state.update_data(img2pdf_creating=True)
 
+        try:
+            await message.delete()
+        except Exception as e:
+            logger.debug(f"Image->PDF: could not delete user's filename message: {e}")
+
         await _edit_workflow_message(
-            query.bot, state,
+            message.bot, state,
             "⏳ Creating your PDF...\n\nPlease wait while your PDF is being generated.",
             None,
         )
 
         page_size = data.get("img2pdf_page_size", PAGE_SIZE_A4)
-        limits = get_effective_limits(query.from_user.id, db_user)
+        limits = get_effective_limits(message.from_user.id, db_user)
         try:
             output_path = await ImageToPDF().convert(
                 order,
@@ -654,50 +701,65 @@ async def pdf_image_to_pdf_create(query: CallbackQuery, state: FSMContext, user_
                 page_size=None if page_size == PAGE_SIZE_ORIGINAL else page_size,
             )
         except Exception as e:
-            await _fail(query.message, state, e, order)
+            await _fail(message, state, e, order)
             return
 
         await track_temp_file(state, output_path)
         cleanup_paths = order + [output_path]
         count = len(order)
-        # Same naming helper Merge uses to turn a base name into a safe
-        # output filename -- Image->PDF has no filename-entry step, so
-        # the base name is fixed rather than user-supplied.
-        filename = f"{sanitize_filename('images')}.pdf"
         status_data = await state.get_data()
         status_chat_id = status_data.get("img2pdf_status_chat_id")
         status_message_id = status_data.get("img2pdf_status_message_id")
         try:
-            await query.bot.send_document(chat_id, FSInputFile(output_path, filename=filename))
+            await message.bot.send_document(chat_id, FSInputFile(output_path, filename=filename))
             await _track_usage(user_repo, db_user)
             if status_chat_id is not None and status_message_id is not None:
                 try:
-                    await query.bot.delete_message(chat_id=status_chat_id, message_id=status_message_id)
+                    await message.bot.delete_message(chat_id=status_chat_id, message_id=status_message_id)
                 except Exception as e:
                     logger.debug(f"Image->PDF: could not delete 'Creating your PDF...' message: {e}")
-            await query.bot.send_message(
+            await message.bot.send_message(
                 chat_id,
                 "✅ PDF created successfully!\n\n"
                 f"🖼 Images\n\n{count}\n\n"
                 f"📄 Page Size\n\n{_PAGE_SIZE_LABELS[page_size]}",
             )
         except PDFProcessingError as e:
-            await query.bot.send_message(chat_id, f"⚠️ {e}")
+            await message.bot.send_message(chat_id, f"⚠️ {e}")
         except Exception:
-            logger.exception(f"Image->PDF: failed to send output to user {query.from_user.id}")
-            await query.bot.send_message(chat_id, "Something went wrong sending your PDF. Please try again.")
+            logger.exception(f"Image->PDF: failed to send output to user {message.from_user.id}")
+            await message.bot.send_message(chat_id, "Something went wrong sending your PDF. Please try again.")
         finally:
             delete_paths(cleanup_paths)
             await untrack_temp_files(state, cleanup_paths)
             await state.clear()
-            logger.info(f"Image->PDF: cleanup done for user {query.from_user.id} ({len(cleanup_paths)} temp paths)")
+            logger.info(f"Image->PDF: cleanup done for user {message.from_user.id} ({len(cleanup_paths)} temp paths)")
+
+
+@router.message(PDFStates.waiting_for_img2pdf_filename)
+async def pdf_image_to_pdf_filename_wrong_input(message: Message):
+    """Catches non-text input while waiting for the output filename. Same
+    treatment as every other invalid input in the toolkit.
+    """
+    try:
+        await message.delete()
+    except Exception as e:
+        logger.debug(f"Image->PDF: could not delete user's invalid (non-text) filename message: {e}")
+    await _send_temp_validation_error(
+        message.bot, message.chat.id,
+        "⚠️ Please send the output filename as text (e.g. my_images).",
+    )
 
 
 # --------------------------------------------------------------------------
 # Cancel (always confirmed)
 # --------------------------------------------------------------------------
 
-_IMG2PDF_STATES = (PDFStates.waiting_for_page_size_img2pdf, PDFStates.waiting_for_images_to_pdf)
+_IMG2PDF_STATES = (
+    PDFStates.waiting_for_page_size_img2pdf,
+    PDFStates.waiting_for_images_to_pdf,
+    PDFStates.waiting_for_img2pdf_filename,
+)
 
 
 async def _img2pdf_full_cleanup(state: FSMContext, chat_id: int) -> None:
@@ -740,6 +802,13 @@ async def pdf_image_to_pdf_cancel_no(query: CallbackQuery, state: FSMContext):
         await _edit_workflow_message(query.bot, state, _render_welcome_text(), _page_size_keyboard())
         return
     order = _current_order(data)
+    if current_state == PDFStates.waiting_for_img2pdf_filename.state:
+        text = (
+            f"🖼 Images Added: {len(order)}\n\n"
+            "📝 Send the output filename (e.g. my_images) -- I'll add .pdf for you."
+        )
+        await _edit_workflow_message(query.bot, state, text, _filename_prompt_keyboard())
+        return
     if not order:
         page_size = data.get("img2pdf_page_size", PAGE_SIZE_A4)
         await _edit_workflow_message(
@@ -802,3 +871,4 @@ async def pdf_to_images_process(message: Message, state: FSMContext, user_repo=N
         filename_fn=lambda i: f"page_{i}.{ext}",
         cleanup_paths=[path] + outputs,
     )
+    
