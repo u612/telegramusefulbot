@@ -5,7 +5,10 @@ from aiogram.fsm.context import FSMContext
 from typing import Optional
 
 from bot.keyboards.main import get_main_menu
-from bot.handlers.pdf import cancel_pending_merge_batch, get_merge_lock
+from bot.handlers.pdf import (
+    cancel_pending_merge_batch, get_merge_lock,
+    cancel_pending_img2pdf_batch, get_img2pdf_lock,
+)
 from core.constants import CB_BACK, CB_HOME, CB_CANCEL
 from core.logger import logger
 from utils.tempfiles import cleanup_tracked_files
@@ -59,14 +62,36 @@ async def _reset_to_main_menu(state: FSMContext, chat_id: Optional[int] = None, 
         except Exception as e:
             logger.debug(f"Reset: could not strip keyboard from stale Merge message: {e}")
 
+    async def _strip_stale_img2pdf_keyboard() -> None:
+        if bot is None:
+            return
+        try:
+            data = await state.get_data()
+        except Exception:
+            return
+        old_chat_id = data.get("img2pdf_status_chat_id")
+        old_message_id = data.get("img2pdf_status_message_id")
+        if old_chat_id is None or old_message_id is None:
+            return
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=old_chat_id, message_id=old_message_id, reply_markup=None
+            )
+        except Exception as e:
+            logger.debug(f"Reset: could not strip keyboard from stale Image->PDF message: {e}")
+
     if chat_id is not None:
         async with get_merge_lock(chat_id):
             await _strip_stale_merge_keyboard()
             cancel_pending_merge_batch(chat_id)
+            async with get_img2pdf_lock(chat_id):
+                await _strip_stale_img2pdf_keyboard()
+                cancel_pending_img2pdf_batch(chat_id)
             await cleanup_tracked_files(state)
             await state.clear()
     else:
         await _strip_stale_merge_keyboard()
+        await _strip_stale_img2pdf_keyboard()
         await cleanup_tracked_files(state)
         await state.clear()
 
